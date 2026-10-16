@@ -1,0 +1,34 @@
+# 仓库只收录插件源码、测试、工具和最必要的说明。
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/README.en.md
+!/__init__.py
+!/manifest.json
+!/config.json
+!/config.md
+!/inkcards_anki_bridge/
+!/tests/
+!/tools/
+!/user_files/
+
+# 运行数据只保留空目录说明，安装包通过 GitHub Releases 分发。
+/user_files/*
+!/user_files/README.txt
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.ankiaddon
+*.anki2*
+*.sqlite*
+*.db
+*.db-*
+.env
+.env.*
+*.pem
+*.key
+*.log
