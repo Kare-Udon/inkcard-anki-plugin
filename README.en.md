@@ -4,7 +4,7 @@
 
 Sync text and image cards and review records between Anki Desktop and [Xteink X4](https://www.xteink.cn/) devices.
 
-Current version: `0.2.0-preview.20`, paired with **InkCards device `0.2.76` (API 2.6)**. The add-on and device use separate version numbers.
+Current version: `0.2.0-preview.20`, paired with **InkCards device `0.2.77` (API 2.6, source baseline 0.2.76 / r8.3)**. The add-on and device use separate version numbers.
 
 The bundled image converter targets macOS Apple Silicon / CPython 3.13. Image support on Windows, Linux, Intel Mac, or another Python ABI is unverified.
 

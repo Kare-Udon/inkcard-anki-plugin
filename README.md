@@ -4,7 +4,7 @@
 
 在 Anki Desktop 与[阅星曈 X4](https://www.xteink.cn/) 设备之间同步图文卡片与复习记录。
 
-当前版本：`0.2.0-preview.20`，配套 **InkCards 设备端 `0.2.76`（API 2.6）**。插件与设备分别编号。
+当前版本：`0.2.0-preview.20`，配套 **InkCards 设备端 `0.2.77`（API 2.6，源码基线 0.2.76 / r8.3）**。插件与设备分别编号。
 
 本包的图像转换组件为 macOS Apple Silicon / CPython 3.13 构建；Windows、Linux、Intel Mac 或其他 Python ABI 的图像功能未经验证。支持范围中的 Anki 版本仍须满足该运行环境。
 
