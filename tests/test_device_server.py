@@ -6,6 +6,9 @@ import socket
 import tempfile
 import time
 import unittest
+from dataclasses import replace
+import uuid
+import secrets
 from pathlib import Path
 
 from inkcards_anki_bridge.device.auth import DeviceAuthenticator
@@ -16,6 +19,40 @@ from inkcards_anki_bridge.storage import ProfileStore
 
 
 class DeviceServerTests(unittest.TestCase):
+    def test_body_progress_has_its_own_timeout_after_headers(self):
+        self.server._httpd.limits = replace(self.server.limits, read_timeout=0.03,
+                                            body_timeout=0.2, body_total_timeout=0.5)
+        with socket.create_connection(("127.0.0.1", self.server.port), timeout=2) as sock:
+            sock.sendall(b"POST /v2/pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{")
+            time.sleep(0.08)
+            sock.sendall(b"}")
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(json.loads(response.read())["error"]["code"], "missing_field")
+
+    def test_body_total_budget_is_bounded_even_with_progress(self):
+        self.server._httpd.limits = replace(self.server.limits, body_timeout=0.2, body_total_timeout=0.3)
+        with socket.create_connection(("127.0.0.1", self.server.port), timeout=2) as sock:
+            sock.sendall(b"POST /v2/pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 50\r\n\r\n{")
+            for _ in range(4):
+                time.sleep(0.08)
+                sock.sendall(b" ")
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(response.status, 408)
+
+    def test_partial_body_timeout_returns_structured_408_and_service_recovers(self):
+        with socket.create_connection(("127.0.0.1", self.server.port), timeout=2) as sock:
+            sock.sendall(b"POST /v2/pair HTTP/1.1\r\nHost: localhost\r\n"
+                         b"Content-Length: 20\r\n\r\n{")
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(response.status, 408)
+            self.assertEqual(json.loads(response.read())["error"]["code"], "request_body_timeout")
+        status, _ = self.request("POST", "/v2/pair", {})
+        self.assertEqual(status, 400)
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.store = ProfileStore(Path(self.tempdir.name), profile_id="profile-a")
@@ -34,6 +71,7 @@ class DeviceServerTests(unittest.TestCase):
                 work_queue_size=1,
                 max_connections=2,
                 read_timeout=0.25,
+                body_timeout=0.25,
                 write_timeout=0.25,
                 shutdown_timeout=1.0,
             ),
@@ -56,9 +94,12 @@ class DeviceServerTests(unittest.TestCase):
 
     def test_real_loopback_pair_handshake_and_deferred_pull(self) -> None:
         code = self.auth.issue_pairing_code()
-        status, body = self.request("POST", "/v2/pair", {"code": code, "device_id": "device-a"})
+        token = secrets.token_hex(32)
+        pairing_id = str(uuid.uuid4())
+        status, body = self.request("POST", "/v2/pair", {"code": code, "device_id": "device-a", "pairing_id": pairing_id, "token": token})
         self.assertEqual(status, 200)
-        token = body["token"]
+        self.assertNotIn("token", body)
+        self.assertEqual(self.request("POST", "/v2/pair/confirm", {"device_id": "device-a", "pairing_id": pairing_id}, {"Authorization": "Bearer " + token})[0], 200)
         status, body = self.request(
             "POST",
             "/v2/handshake",

@@ -1,15 +1,10 @@
-"""Anki 原生 Qt 对话框。
-
-本文件不在模块导入阶段加载 Qt。``InkCardsDialog`` 只是一个小型 wrapper，真正的
-QDialog/QTimer/QWidget 类型由 ``_load_qt()`` 在 Anki 菜单 action 第一次注册时取得，
-因此普通 Python 导入 presenter/plugin 不会触碰 aqt/PyQt。
-"""
+"""Anki 原生 Qt 设备管理辅助窗口。"""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
-from .presenter import InkCardsPresenter, ViewState, is_valid_device_id
+from .presenter import InkCardsPresenter, ViewState
 
 
 def _load_qt() -> Any:
@@ -42,30 +37,26 @@ def _message_button(message_box: Any, name: str) -> Any:
     return getattr(standard_button, name, None) if standard_button is not None else None
 
 
-class InkCardsDialog:
-    """可复用的非模态 QDialog；关闭时只取消 UI 作业，不停止 runtime。"""
+class DeviceManagementDialog:
+    """管理配对设备；关闭窗口不会关闭 presenter 或 runtime。"""
 
     def __init__(
         self,
         *,
         parent: Any,
         runtime_provider: Callable[[], Any],
-        config_writer: Optional[Callable[[bool], Any]] = None,
         qt_module: Any = None,
         presenter: InkCardsPresenter | None = None,
     ) -> None:
         self._qt = qt_module or _load_qt()
-        self._presenter = presenter or InkCardsPresenter(
-            runtime_provider,
-            config_writer=config_writer,
-        )
+        self._presenter = presenter or InkCardsPresenter(runtime_provider)
         self._dialog = self._qt.QDialog(parent)
-        self._dialog.setWindowTitle("InkCards")
+        self._dialog.setWindowTitle("InkCards · 设备管理")
         set_modal = getattr(self._dialog, "setModal", None)
         if callable(set_modal):
             set_modal(False)
-        self._cleaned = False
-        self._catalog_ids: tuple[str, ...] = ()
+        self._device_signature: tuple[tuple[str, str], ...] = ()
+        self._closed = False
         self._build_widgets()
         finished = getattr(self._dialog, "finished", None)
         if finished is not None and callable(getattr(finished, "connect", None)):
@@ -76,237 +67,192 @@ class InkCardsDialog:
         return self._presenter
 
     @property
-    def action_parent(self) -> Any:
+    def dialog(self) -> Any:
         return self._dialog
 
     @property
-    def dialog(self) -> Any:
+    def action_parent(self) -> Any:
         return self._dialog
 
     def _build_widgets(self) -> None:
         qt = self._qt
         root = qt.QVBoxLayout(self._dialog)
-        self._status_label = qt.QLabel()
-        self._status_label.setWordWrap(True)
-        root.addWidget(self._status_label)
+        title = qt.QLabel("设备管理")
+        root.addWidget(title)
 
         top = qt.QHBoxLayout()
         self._refresh_button = qt.QPushButton("刷新")
-        self._pair_button = qt.QPushButton("生成配对码")
-        self._recovery_button = qt.QPushButton("恢复已批准的评分")
+        self._add_device_button = qt.QPushButton("添加设备")
+        self._show_removed_checkbox = qt.QCheckBox("显示已移除")
         top.addWidget(self._refresh_button)
-        top.addWidget(self._pair_button)
-        top.addWidget(self._recovery_button)
+        top.addWidget(self._add_device_button)
+        top.addWidget(self._show_removed_checkbox)
         root.addLayout(top)
 
         self._pairing_label = qt.QLabel()
         self._pairing_label.setWordWrap(True)
         root.addWidget(self._pairing_label)
+        self._device_list = qt.QListWidget()
+        root.addWidget(self._device_list)
 
-        revoke_row = qt.QHBoxLayout()
-        self._device_input = qt.QLineEdit()
-        self._device_input.setPlaceholderText("设备 ID")
-        self._revoke_button = qt.QPushButton("撤销设备")
-        revoke_row.addWidget(self._device_input)
-        revoke_row.addWidget(self._revoke_button)
-        root.addLayout(revoke_row)
+        actions = qt.QHBoxLayout()
+        self._allow_rebind_button = qt.QPushButton("允许重新绑定")
+        self._reset_pairing_button = qt.QPushButton("重置配对码")
+        self._rename_device_button = qt.QPushButton("改名")
+        self._remove_device_button = qt.QPushButton("移除设备")
+        for button in (
+            self._allow_rebind_button,
+            self._reset_pairing_button,
+            self._rename_device_button,
+            self._remove_device_button,
+        ):
+            actions.addWidget(button)
+        root.addLayout(actions)
 
-        self._lan_checkbox = qt.QCheckBox("允许局域网设备连接")
-        root.addWidget(self._lan_checkbox)
-
-        self._deck_list = qt.QListWidget()
-        root.addWidget(self._deck_list)
-
-        deck_actions = qt.QHBoxLayout()
-        self._preflight_button = qt.QPushButton("预检所选牌组")
-        self._snapshot_button = qt.QPushButton("准备快照")
-        self._cancel_button = qt.QPushButton("取消当前作业")
-        deck_actions.addWidget(self._preflight_button)
-        deck_actions.addWidget(self._snapshot_button)
-        deck_actions.addWidget(self._cancel_button)
-        root.addLayout(deck_actions)
-
-        self._preflight_label = qt.QLabel()
-        self._preflight_label.setWordWrap(True)
-        self._snapshot_label = qt.QLabel()
-        self._snapshot_label.setWordWrap(True)
         self._message_label = qt.QLabel()
         self._message_label.setWordWrap(True)
-        root.addWidget(self._preflight_label)
-        root.addWidget(self._snapshot_label)
         root.addWidget(self._message_label)
 
         self._refresh_button.clicked.connect(self._refresh)
-        self._pair_button.clicked.connect(self._issue_pairing_code)
-        self._recovery_button.clicked.connect(self._request_approved_recovery)
-        self._revoke_button.clicked.connect(self._revoke_device)
-        self._preflight_button.clicked.connect(self._request_preflight)
-        self._snapshot_button.clicked.connect(self._request_snapshot)
-        self._cancel_button.clicked.connect(self._cancel_active)
-        self._deck_list.itemChanged.connect(self._selection_changed)
-        self._lan_checkbox.toggled.connect(self._lan_toggled)
-
-        self._timer = qt.QTimer(self._dialog)
-        self._timer.setInterval(200)
-        self._timer.timeout.connect(self._poll)
+        self._add_device_button.clicked.connect(self._add_device)
+        self._allow_rebind_button.clicked.connect(self._allow_rebind)
+        self._reset_pairing_button.clicked.connect(self._reset_pairing_code)
+        self._rename_device_button.clicked.connect(self._rename_device)
+        self._remove_device_button.clicked.connect(self._remove_device)
+        self._device_list.itemSelectionChanged.connect(self._device_selection_changed)
+        self._show_removed_checkbox.toggled.connect(self._show_removed_toggled)
         self._render(self._presenter.view())
 
     def _refresh(self) -> None:
-        self._render(self._presenter.refresh())
+        self._render(self._presenter.refresh_devices())
 
-    def _issue_pairing_code(self) -> None:
-        self._presenter.issue_pairing_code()
+    def _add_device(self) -> None:
+        name, accepted = self._qt.QInputDialog.getText(
+            self._dialog,
+            "添加设备",
+            "设备名称（1 至 128 个可见字符）",
+        )
+        if accepted:
+            self._presenter.add_device(name)
         self._render(self._presenter.view())
 
-    def _request_approved_recovery(self) -> None:
-        self._presenter.request_approved_recovery()
-        self._render(self._presenter.view())
-
-    def _revoke_device(self) -> None:
-        device_id = self._device_input.text()
-        if not is_valid_device_id(device_id):
-            self._presenter.revoke_device(device_id)
-            self._render(self._presenter.view())
-            return
+    def _confirm(self, title: str, message: str) -> bool:
         message_box = self._qt.QMessageBox
         yes = _message_button(message_box, "Yes")
         no = _message_button(message_box, "No")
-        answer = message_box.question(
-            self._dialog,
-            "确认撤销",
-            "撤销后该设备将不能继续认证，是否继续？",
-            yes,
-            no,
+        answer = message_box.question(self._dialog, title, message, yes, no)
+        return answer == yes
+
+    def _allow_rebind(self) -> None:
+        if self._confirm(
+            "允许重新绑定", "下次使用固定配对码时，此名额可绑定另一台设备。继续？"
+        ):
+            self._presenter.allow_rebind_selected()
+        self._render(self._presenter.view())
+
+    def _reset_pairing_code(self) -> None:
+        if self._confirm(
+            "重置配对码",
+            "旧配对码和未完成的配对尝试会失效；已绑定设备的连接保持不变。继续？",
+        ):
+            self._presenter.reset_pairing_code_selected()
+        self._render(self._presenter.view())
+
+    def _rename_device(self) -> None:
+        state = self._presenter.view()
+        selected = next(
+            (item for item in state.devices if item.slot_id == state.selected_slot_id),
+            None,
         )
-        if answer == yes:
-            self._presenter.revoke_device(device_id)
+        if selected is not None:
+            name, accepted = self._qt.QInputDialog.getText(
+                self._dialog,
+                "修改设备名称",
+                "设备名称（1 至 128 个可见字符）",
+                text=selected.name,
+            )
+            if accepted:
+                self._presenter.rename_selected_device(name)
         self._render(self._presenter.view())
 
-    def _request_preflight(self) -> None:
-        self._presenter.request_preflight()
+    def _remove_device(self) -> None:
+        if self._confirm(
+            "确认移除设备",
+            "移除会撤销该设备的连接凭据和会话，但保留既有同步与评分历史。是否继续？",
+        ):
+            self._presenter.remove_selected_device()
         self._render(self._presenter.view())
 
-    def _request_snapshot(self) -> None:
-        self._presenter.request_snapshot()
+    def _device_selection_changed(self) -> None:
+        item = self._device_list.currentItem()
+        role = _enum_value(self._qt.Qt, "UserRole", 32)
+        slot_id = item.data(role) if item is not None else None
+        self._presenter.select_device(slot_id)
         self._render(self._presenter.view())
 
-    def _cancel_active(self) -> None:
-        self._presenter.cancel_active()
-        self._render(self._presenter.view())
+    def _show_removed_toggled(self, enabled: bool) -> None:
+        self._render(self._presenter.set_show_removed(enabled))
 
-    def _selection_changed(self, _item: Any) -> None:
-        selected = []
-        count = self._deck_list.count()
-        checked = _enum_value(self._qt.Qt, "Checked", None)
-        for index in range(count):
-            item = self._deck_list.item(index)
-            if item.checkState() == checked:
-                role = _enum_value(self._qt.Qt, "UserRole", 32)
-                value = item.data(role)
-                if value is not None:
-                    selected.append(str(value))
-        self._presenter.select_decks(selected)
-        self._render(self._presenter.view())
-
-    def _lan_toggled(self, enabled: bool) -> None:
-        if self._presenter.set_lan_enabled(enabled):
-            self._show_information(self._presenter.view().config_message)
-        else:
-            self._set_lan_checkbox(self._presenter.view().status.lan_enabled)
-        self._render(self._presenter.view())
-
-    def _show_information(self, text: str) -> None:
-        if not text:
-            return
-        information = getattr(self._qt.QMessageBox, "information", None)
-        if callable(information):
-            information(self._dialog, "InkCards", text)
-
-    def _set_lan_checkbox(self, enabled: bool) -> None:
-        blocker = getattr(self._lan_checkbox, "blockSignals", None)
+    def _set_show_removed_checkbox(self, enabled: bool) -> None:
+        blocker = getattr(self._show_removed_checkbox, "blockSignals", None)
         if callable(blocker):
             blocker(True)
-        self._lan_checkbox.setChecked(enabled)
+        self._show_removed_checkbox.setChecked(enabled)
         if callable(blocker):
             blocker(False)
 
-    def _poll(self) -> None:
-        self._render(self._presenter.poll())
-
     def _render(self, state: ViewState) -> None:
-        status = state.status
-        delivery = "、".join(f"{item.label}{item.count}" for item in status.delivery)
-        application = "、".join(f"{item.label}{item.count}" for item in status.application)
-        self._status_label.setText(
+        self._pairing_label.setText(state.pairing_message)
+        self._message_label.setText(
             "\n".join(
-                (
-                    status.service_text,
-                    f"监听：{status.host_text}:{status.port_text}",
-                    f"设备：{status.devices}；事件：{status.events}；冲突：{status.conflicts}",
-                    f"交付：{delivery}",
-                    f"应用：{application}",
-                    f"快照：{status.snapshots}；generation：{status.generation_text}",
-                    f"牌组目录：{status.catalog_text}",
-                    f"范围预检：{status.preflight_text}",
-                    f"写回状态：{status.write_disabled_reason}",
-                    status.lan_notice,
-                )
+                item for item in (state.config_message, state.error_message) if item
             )
         )
-        self._pairing_label.setText(state.pairing_message)
-        self._preflight_label.setText(state.preflight_message or status.preflight_text)
-        self._snapshot_label.setText(state.snapshot_message)
-        messages = "\n".join(item for item in (state.config_message, state.error_message, state.recovery_message) if item)
-        self._message_label.setText(messages)
-        self._pairing_button_set_enabled(state.buttons.pairing)
-        self._revoke_button.setEnabled(state.buttons.revoke)
-        self._preflight_button.setEnabled(state.buttons.preflight)
-        self._snapshot_button.setEnabled(state.buttons.snapshot)
-        self._cancel_button.setEnabled(state.buttons.cancel)
-        self._refresh_button.setEnabled(state.buttons.refresh)
-        self._recovery_button.setEnabled(state.buttons.recovery)
-        self._lan_checkbox.setEnabled(state.buttons.lan)
-        self._set_lan_checkbox(status.lan_enabled)
+        for button, enabled in (
+            (self._refresh_button, state.buttons.refresh),
+            (self._add_device_button, state.buttons.add_device),
+            (self._allow_rebind_button, state.buttons.allow_rebind),
+            (self._reset_pairing_button, state.buttons.reset_pairing_code),
+            (self._remove_device_button, state.buttons.remove_device),
+            (self._rename_device_button, state.buttons.rename_device),
+        ):
+            button.setEnabled(enabled)
+        self._set_show_removed_checkbox(state.show_removed)
 
-        ids = tuple(item.deck_id for item in state.decks)
-        if ids != self._catalog_ids:
-            self._catalog_ids = ids
-            blocker = getattr(self._deck_list, "blockSignals", None)
+        signature = tuple((item.slot_id, item.label) for item in state.devices)
+        if signature != self._device_signature:
+            self._device_signature = signature
+            blocker = getattr(self._device_list, "blockSignals", None)
             if callable(blocker):
                 blocker(True)
-            self._deck_list.clear()
+            self._device_list.clear()
             role = _enum_value(self._qt.Qt, "UserRole", 32)
-            unchecked = _enum_value(self._qt.Qt, "Unchecked", 0)
-            user_checkable = _enum_value(self._qt.Qt, "ItemIsUserCheckable", 16)
-            for deck in state.decks:
-                item = self._qt.QListWidgetItem(("  " * deck.depth) + deck.label)
-                item.setData(role, deck.deck_id)
-                item.setFlags(item.flags() | user_checkable)
-                item.setCheckState(
-                    _enum_value(self._qt.Qt, "Checked", 2)
-                    if deck.deck_id in state.selected_ids
-                    else unchecked
-                )
-                self._deck_list.addItem(item)
+            for device in state.devices:
+                item = self._qt.QListWidgetItem(device.label)
+                item.setData(role, device.slot_id)
+                self._device_list.addItem(item)
             if callable(blocker):
                 blocker(False)
-
-    def _pairing_button_set_enabled(self, enabled: bool) -> None:
-        self._pair_button.setEnabled(enabled)
+        selected_index = next(
+            (
+                index
+                for index, item in enumerate(state.devices)
+                if item.slot_id == state.selected_slot_id
+            ),
+            -1,
+        )
+        blocker = getattr(self._device_list, "blockSignals", None)
+        if callable(blocker):
+            blocker(True)
+        self._device_list.setCurrentRow(selected_index)
+        if callable(blocker):
+            blocker(False)
 
     def _on_finished(self, _result: Any = None) -> None:
-        self._cleanup()
-
-    def _cleanup(self) -> None:
-        if self._cleaned:
-            return
-        self._cleaned = True
-        if self._timer.isActive():
-            self._timer.stop()
-        self._presenter.close()
+        self._closed = True
 
     def show(self) -> None:
-        self._cleaned = False
+        self._closed = False
         self._presenter.reopen()
         self._dialog.show()
         raise_window = getattr(self._dialog, "raise_", None)
@@ -315,11 +261,10 @@ class InkCardsDialog:
         activate = getattr(self._dialog, "activateWindow", None)
         if callable(activate):
             activate()
-        self._timer.start()
         self._refresh()
 
     def close(self) -> None:
-        self._cleanup()
+        self._closed = True
         self._dialog.close()
 
     def is_visible(self) -> bool:
@@ -333,4 +278,4 @@ class InkCardsDialog:
             delete_later()
 
 
-__all__ = ["InkCardsDialog"]
+__all__ = ["DeviceManagementDialog"]

@@ -74,9 +74,7 @@ class SnapshotRouteTests(unittest.TestCase):
             limits=RouteLimits(max_request_bytes=16_384, max_response_bytes=16_384),
         )
         code = self.auth.issue_pairing_code()
-        status, body = self.call("POST", "/v2/pair", {"code": code, "device_id": "device-a"})
-        self.assertEqual(status, 200)
-        self.token = body["token"]
+        self.token = self.auth.pair(code, "device-a").token
         self.headers = {"Authorization": "Bearer " + self.token}
         status, _ = self.call(
             "POST",
@@ -459,13 +457,8 @@ class SnapshotRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
         pairing_code = self.auth.issue_pairing_code()
-        status, paired = self.call(
-            "POST",
-            "/v2/pair",
-            {"code": pairing_code, "device_id": "device-b"},
-        )
-        self.assertEqual(status, 200)
-        headers_b = {"Authorization": "Bearer " + paired["token"]}
+        credential_b = self.auth.pair(pairing_code, "device-b")
+        headers_b = {"Authorization": "Bearer " + credential_b.token}
         status, _ = self.call(
             "POST",
             "/v2/handshake",

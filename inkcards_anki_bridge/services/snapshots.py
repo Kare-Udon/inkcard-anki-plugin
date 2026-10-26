@@ -25,7 +25,6 @@ from ..storage import (
     CommitUnknownError,
     ProfileStore,
     StorageValidationError,
-    PermitRecord,
     PullProgressRecord,
 )
 
@@ -392,6 +391,10 @@ class SnapshotService:
             raise SnapshotError("snapshot_corrupt", status=503, retryable=True) from None
 
     @staticmethod
+    def _watermark(value: Any) -> int:
+        return _watermark(value)
+
+    @staticmethod
     def _generation(
         generation: Optional[int],
         snapshot_generation: Optional[int],
@@ -676,11 +679,12 @@ class SnapshotService:
         if not isinstance(source, Mapping) or set(source) != {"kind", "ids"}:
             raise SnapshotError("snapshot_refresh_scope_invalid", status=409)
         kind, ids = source["kind"], source["ids"]
-        if kind not in {"card", "deck"} or not isinstance(ids, (list, tuple)):
+        if kind not in {"card", "deck", "exclude"} or not isinstance(ids, (list, tuple)):
             raise SnapshotError("snapshot_refresh_scope_invalid", status=409)
         try:
             scope = make_scope(card_ids=ids if kind == "card" else None,
-                               deck_ids=ids if kind == "deck" else None)
+                               deck_ids=ids if kind == "deck" else None,
+                               excluded_deck_ids=ids if kind == "exclude" else None)
         except SnapshotJobError:
             raise SnapshotError("snapshot_refresh_scope_invalid", status=409) from None
         if scope.scope_id != scope_id:

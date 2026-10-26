@@ -192,7 +192,7 @@ class CatalogJobsTests(unittest.TestCase):
         self.assertEqual(result.card_count, 2)
         self.assertEqual(result.snapshot_limit, 4)
         self.assertTrue(result.within_limit)
-        self.assertEqual(self.collection.decks.count_calls, [((10, 20), True)])
+        self.assertEqual(self.collection.decks.count_calls, [((10,), True), ((20,), True), ((30,), True), ((10, 20), True)])
         self.assertFalse(self.collection.db_accessed)
 
     def test_preflight_reports_count_over_snapshot_limit(self) -> None:
@@ -209,12 +209,12 @@ class CatalogJobsTests(unittest.TestCase):
         self.assertEqual(result.card_count, 5)
         self.assertIn("snapshot", result.error_message or "")
 
-    def test_scope_is_explicit_non_empty_and_bounded_at_64(self) -> None:
+    def test_scope_is_explicit_non_empty_and_bounded_at_4096(self) -> None:
         with self.assertRaises(CatalogJobError) as empty:
             self.manager.request_preflight(deck_ids=[])
         self.assertEqual(empty.exception.code, "scope_required")
         with self.assertRaises(CatalogJobError) as too_large:
-            self.manager.request_preflight(deck_ids=[str(value) for value in range(1, 66)])
+            self.manager.request_preflight(deck_ids=[str(value) for value in range(1, 4098)])
         self.assertEqual(too_large.exception.code, "scope_too_large")
         self.assertEqual(self.host.pending, [])
 

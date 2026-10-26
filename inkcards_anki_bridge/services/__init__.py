@@ -7,6 +7,7 @@ from .snapshots import (
     SnapshotPublication,
     SnapshotService,
 )
+from .snapshot_files import ArtifactError, SnapshotFilesService
 
 __all__ = [
     "Inbox",
@@ -15,4 +16,6 @@ __all__ = [
     "SnapshotError",
     "SnapshotPublication",
     "SnapshotService",
+    "ArtifactError",
+    "SnapshotFilesService",
 ]

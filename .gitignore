@@ -12,10 +12,12 @@
 !/tests/
 !/tools/
 !/user_files/
+!/vendor/
 
 # 运行数据只保留空目录说明，安装包通过 GitHub Releases 分发。
 /user_files/*
-!/user_files/README.txt
+!/user_files/
+!/vendor/README.txt
 __pycache__/
 *.py[cod]
 .DS_Store

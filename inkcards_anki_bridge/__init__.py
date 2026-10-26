@@ -5,6 +5,6 @@
 和 ``plugin.py`` 按需加载。
 """
 
-__version__ = "0.2.0-preview.10"
+__version__ = "0.2.0-preview.20"
 
 __all__ = ["__version__"]

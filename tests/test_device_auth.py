@@ -53,9 +53,9 @@ class DeviceAuthTests(unittest.TestCase):
         self.store.close()
         self.tempdir.cleanup()
 
-    def test_pairing_uses_one_time_six_digit_code_and_persists_only_token_hash(self) -> None:
+    def test_pairing_uses_fixed_twelve_digit_code_and_persists_only_token_hash(self) -> None:
         code = self.auth.issue_pairing_code()
-        self.assertRegex(code, r"^\d{6}$")
+        self.assertRegex(code, r"^\d{12}$")
         credential = self.auth.pair(code, "device-a")
         self.assertEqual(len(credential.token), 64)
         self.assertNotIn(credential.token, repr(credential))
@@ -70,21 +70,20 @@ class DeviceAuthTests(unittest.TestCase):
         self.assertEqual(row[0], hashlib.sha256(credential.token.encode()).hexdigest())
         self.assertNotEqual(row[0], credential.token)
 
-        with self.assertRaisesRegex(AuthError, "invalid_or_expired_pairing_code"):
+        with self.assertRaisesRegex(AuthError, "device_already_bound"):
             self.auth.pair(code, "device-b")
 
-    def test_expiry_wrong_attempts_and_rate_limit_are_bounded(self) -> None:
+    def test_fixed_code_has_no_expiry_and_wrong_attempts_are_rate_limited(self) -> None:
         code = self.auth.issue_pairing_code()
         self.clock.now += 101
-        with self.assertRaisesRegex(AuthError, "invalid_or_expired_pairing_code"):
-            self.auth.pair(code, "device-a")
+        self.assertEqual(self.auth.pair(code, "device-before").device_id, "device-before")
 
         self.clock.now = 2_000_000
         for _ in range(3):
-            with self.assertRaisesRegex(AuthError, "invalid_or_expired_pairing_code"):
-                self.auth.pair("000000", "device-a")
+            with self.assertRaisesRegex(AuthError, "invalid_pairing_code"):
+                self.auth.pair("000000000000", "device-a")
         with self.assertRaisesRegex(AuthError, "pairing_rate_limited"):
-            self.auth.pair("000000", "device-a")
+            self.auth.pair("000000000000", "device-a")
         self.clock.now += 51
         code = self.auth.issue_pairing_code()
         self.assertEqual(self.auth.pair(code, "device-a").device_id, "device-a")

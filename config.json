@@ -2,5 +2,9 @@
   "device_server": {
     "host": "127.0.0.1",
     "port": 8766
+  },
+  "logging": {
+    "level": "warn",
+    "console": false
   }
 }

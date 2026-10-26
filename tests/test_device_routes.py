@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import uuid
+import secrets
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -24,9 +26,12 @@ class DeviceRouteTests(unittest.TestCase):
             limits=RouteLimits(max_request_bytes=16_384, max_response_bytes=16_384, max_review_events=3),
         )
         code = self.auth.issue_pairing_code()
-        response = self.call("POST", "/v2/pair", {"code": code, "device_id": "device-a"})
+        self.token = secrets.token_hex(32)
+        pairing_id = str(uuid.uuid4())
+        response = self.call("POST", "/v2/pair", {"code": code, "device_id": "device-a", "pairing_id": pairing_id, "token": self.token})
         self.assertEqual(response[0], 200)
-        self.token = response[1]["token"]
+        self.assertNotIn("token", response[1])
+        self.assertEqual(self.call("POST", "/v2/pair/confirm", {"device_id": "device-a", "pairing_id": pairing_id}, {"Authorization": "Bearer " + self.token})[0], 200)
         self.headers = {"Authorization": "Bearer " + self.token}
         status, body = self.call(
             "POST",
@@ -195,6 +200,53 @@ class DeviceRouteTests(unittest.TestCase):
         )
         self.assertLessEqual(len(response.body), 64)
         self.assertIn(response.status, (200, 413, 503))
+
+    def test_pair_http_requires_client_transaction_and_confirm_bearer(self):
+        slot = self.auth.add_device("新阅读器")
+        token = secrets.token_hex(32)
+        pairing_id = str(uuid.uuid4())
+        legacy = {"code": slot["code"], "device_id": "new-reader"}
+        self.assertEqual(self.call("POST", "/v2/pair", legacy)[0], 400)
+        request = dict(legacy, token=token, pairing_id=pairing_id)
+        status, body = self.call("POST", "/v2/pair", request)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "pending")
+        self.assertTrue(body["capabilities"]["device_management_v1"])
+        self.assertNotIn("token", body)
+        self.assertNotIn("code", body)
+        confirm = {"device_id": "new-reader", "pairing_id": pairing_id}
+        self.assertEqual(self.call("POST", "/v2/pair/confirm", confirm)[0], 401)
+        bearer = {"Authorization": "Bearer " + token}
+        self.assertEqual(self.call("POST", "/v2/handshake", {"protocol": "x4-2", "device_id": "new-reader"}, bearer)[0], 401)
+        status, active = self.call("POST", "/v2/pair/confirm", confirm, bearer)
+        self.assertEqual(status, 200)
+        self.assertEqual(active["status"], "active")
+        self.assertEqual(self.call("POST", "/v2/pair/confirm", confirm, bearer)[1], active)
+        self.assertEqual(self.call("POST", "/v2/pair", request)[1]["status"], "active")
+        self.assertEqual(self.call("POST", "/v2/pair", dict(request, code="123456"))[1]["error"]["code"], "pairing_code_upgrade_required")
+
+    def test_pair_storage_failures_keep_safe_types_and_off_stays_silent(self):
+        import io
+        from unittest.mock import patch
+        from inkcards_anki_bridge.logging_control import AddonLogger
+        from inkcards_anki_bridge.storage import BusyStorageError
+        for level in ("debug", "off"):
+            output = io.StringIO()
+            logger = AddonLogger(self.store.root, policy={"level": level, "console": True}, console_stream=output)
+            self.router.logger = logger
+            request = {"code": "123456789012", "device_id": "private-reader", "pairing_id": str(uuid.uuid4()), "token": "c" * 64}
+            with patch.object(self.store, "prepare_device_pairing", side_effect=BusyStorageError("PRIVATE-ERROR", "sqlite_busy_timeout")):
+                status, body = self.call("POST", "/v2/pair", request)
+            self.assertEqual((status, body["error"]["code"]), (503, "storage_busy"))
+            log = output.getvalue()
+            if level == "off":
+                self.assertEqual(log, "")
+            else:
+                self.assertIn("BusyStorageError", log)
+                self.assertIn("sqlite_busy_timeout", log)
+            for private in ["123456789012", "PRIVATE-ERROR", "private-reader", "c" * 64]:
+                self.assertNotIn(private, log)
+            logger.close()
 
 
 if __name__ == "__main__":

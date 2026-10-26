@@ -50,6 +50,8 @@ class ToolsUiRegistration:
         action: Any,
         runtime_provider: Callable[[], Any],
         config_writer: Optional[Callable[[bool], Any]],
+        logging_policy_provider: Optional[Callable[[], Any]],
+        logging_policy_writer: Optional[Callable[[Any], Any]],
         dialog_factory: Optional[Callable[..., Any]],
         qt_module: Any,
     ) -> None:
@@ -57,6 +59,8 @@ class ToolsUiRegistration:
         self.action = action
         self._runtime_provider = runtime_provider
         self._config_writer = config_writer
+        self._logging_policy_provider = logging_policy_provider
+        self._logging_policy_writer = logging_policy_writer
         self._dialog_factory = dialog_factory
         self._qt = qt_module
         self._dialog: Any = None
@@ -71,15 +75,20 @@ class ToolsUiRegistration:
         if self._dialog is None:
             factory = self._dialog_factory
             if factory is None:
-                from .dialog import InkCardsDialog
+                from .default_sync_dialog import InkCardsDialog
 
                 factory = InkCardsDialog
-            self._dialog = factory(
+            kwargs = dict(
                 parent=self.main_window,
                 runtime_provider=self._runtime_provider,
                 config_writer=self._config_writer,
                 qt_module=self._qt,
             )
+            if self._logging_policy_provider is not None:
+                kwargs["logging_policy_provider"] = self._logging_policy_provider
+            if self._logging_policy_writer is not None:
+                kwargs["logging_policy_writer"] = self._logging_policy_writer
+            self._dialog = factory(**kwargs)
         self._dialog.show()
 
     def close(self) -> None:
@@ -112,6 +121,8 @@ def register_tools_action(
     aqt_module: Any,
     runtime_provider: Callable[[], Any],
     config_writer: Optional[Callable[[bool], Any]] = None,
+    logging_policy_provider: Optional[Callable[[], Any]] = None,
+    logging_policy_writer: Optional[Callable[[Any], Any]] = None,
     qt_module: Any = None,
     dialog_factory: Optional[Callable[..., Any]] = None,
 ) -> Optional[ToolsUiRegistration]:
@@ -146,6 +157,8 @@ def register_tools_action(
         action=action,
         runtime_provider=runtime_provider,
         config_writer=config_writer,
+        logging_policy_provider=logging_policy_provider,
+        logging_policy_writer=logging_policy_writer,
         dialog_factory=dialog_factory,
         qt_module=qt,
     )

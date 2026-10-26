@@ -34,6 +34,7 @@ from .errors import (
     UnsupportedDatabaseError,
 )
 from .migrations import SCHEMA_VERSION, apply_migrations
+from .device_management import DeviceManagementStore
 from .models import (
     ApplicationRecord,
     ApplyIntent,
@@ -304,7 +305,7 @@ def _prepare_event(event: Any, session_id: str) -> _PreparedEvent:
     )
 
 
-class ProfileStore:
+class ProfileStore(DeviceManagementStore):
     """一个 Anki profile 的独立插件 SQLite 存储。"""
 
     def __init__(
@@ -2377,6 +2378,7 @@ class ProfileStore:
             chain_rows: List[sqlite3.Row] = []
             used_card_projection = False
             frozen_baseline = None
+            compatibility_verified = False
             for row in remaining:
                 self._require_valid_compact_terminal_receipt(db, row)
             snapshot_row = db.execute(
@@ -2448,9 +2450,32 @@ class ProfileStore:
                     verify_card_snapshot(anchor_card, frozen_card, last_review_time_source=source)
                 except (CompactProjectionError, KeyError, TypeError, ValueError) as exc:
                     raise ReceiptRegressionError('native before is not the frozen snapshot card', 'compact_snapshot_baseline_invalid') from exc
-                self._require_snapshot_counter_path(db, context, collection_generation, collection_identity, before)
+                proof_json = native_plan.get("policy", {}).get("baseline_proof_json")
+                if proof_json is not None and json.loads(policy).get("authorization") != native_plan.get("policy"):
+                    raise ReceiptRegressionError("compatibility policy differs from plan", "compact_snapshot_baseline_invalid")
+                if proof_json is not None:
+                    from ..anki.compact_projection import json_sha256
+                    history_hash = context.source.card_review_log_hashes.get(str(event["card_id"]))
+                    if history_hash is None:
+                        history_hash = context.source.card_last_review_time_sources.get(str(event["card_id"]), {}).get("revlog_sha256")
+                    if history_hash is None or json_sha256(anchor["before"].get("native_revlogs")) != history_hash:
+                        raise ReceiptRegressionError("frozen review history is not proven", "compact_snapshot_baseline_invalid")
+                    if chain_rows:
+                        latest = chain_rows[0]
+                        evidence = {row["stage"]: json.loads(row["evidence_json"]) for row in db.execute(
+                            "SELECT stage,evidence_json FROM compact_score_evidence WHERE profile_id=? AND device_id=? AND session_id=? AND sequence=?",
+                            (self._profile_id, latest["device_id"], latest["session_id"], latest["sequence"]),
+                        ).fetchall()}
+                        final = evidence.get("score_verified", {}).get("native_observed")
+                        if final is None:
+                            final = evidence.get("recovery_classification", {}).get("verification", {}).get("final_native_readback")
+                        if not isinstance(final, Mapping) or not isinstance(final.get("native_revlogs"), list) or final["native_revlogs"] != native_plan["before"].get("native_revlogs"):
+                            raise ReceiptRegressionError("latest receipt history changed", "compact_snapshot_baseline_invalid")
+                compatibility_verified = self._require_snapshot_counter_path(
+                    db, context, collection_generation, collection_identity, before, proof_json=proof_json,
+                )
 
-            if chain_rows:
+            if chain_rows and not compatibility_verified:
                 if used_card_projection:
                     first_generation = min(int(row["collection_generation"]) for row in chain_rows)
                     self._require_compact_generation_receipt_path(
@@ -2739,37 +2764,68 @@ class ProfileStore:
             result[deck_id] = _canonical_object_json(value, "deck_counters")
         return result
 
-    def _require_snapshot_counter_path(self, db: sqlite3.Connection, context: Any,
-                                      generation: int, identity: str, before_json: str) -> None:
-        """冻结帧开始的 generation 边逐一验证，不信任 caller 的重建标记。"""
-        fields = ('last_day_studied','new_studied','review_studied','milliseconds_studied','learning_studied')
-        counters = {did:_canonical_object_json({name:node[name] for name in fields}, 'snapshot_counters')
-                    for did,node in context.source.deck_contexts.items()}
-        cursor = context.source.collection_generation
+    def _require_snapshot_counter_path(
+        self,
+        db: sqlite3.Connection,
+        context: Any,
+        generation: int,
+        identity: str,
+        before_json: str,
+        *,
+        proof_json: Optional[str] = None,
+    ) -> bool:
+        """独立重算冻结帧、完整终态收据和间隙依据，再比对实际评分前态。"""
+        from ..anki.compact_projection import (
+            resolve_counter_baseline,
+            CompactProjectionError,
+        )
+
         rows = db.execute(
             "SELECT * FROM compact_applications WHERE profile_id=? AND status='applied' "
             "AND collection_generation>=? AND collection_generation<?",
-            (self._profile_id,cursor,generation),
+            (self._profile_id, context.source.collection_generation, generation),
         ).fetchall()
-        while cursor < generation:
-            edges = [row for row in rows if int(row['collection_generation']) == cursor]
-            if len(edges) != 1:
-                raise ReceiptRegressionError('snapshot generation path has a gap or fork', 'compact_snapshot_baseline_invalid')
-            edge = edges[0]
-            self._require_valid_compact_terminal_receipt(db, edge)
-            if edge['collection_identity'] != identity or edge['collection_generation_after'] != cursor+1:
-                raise ReceiptRegressionError('snapshot generation edge is discontinuous', 'compact_snapshot_baseline_invalid')
-            previous = self._compact_frame_counters(edge['before_json'])
-            after = self._compact_frame_counters(edge['after_json'])
-            if not previous or not after or set(previous) != set(after):
-                raise ReceiptRegressionError('snapshot generation edge lacks counters', 'compact_snapshot_baseline_invalid')
-            if any(did in counters and counters[did] != value for did,value in previous.items()):
-                raise ReceiptRegressionError('snapshot counters are discontinuous', 'compact_snapshot_baseline_invalid')
-            counters.update({did:value for did,value in after.items() if did in counters})
-            cursor += 1
+        edges = []
+        for row in rows:
+            self._require_valid_compact_terminal_receipt(db, row)
+            edges.append(
+                {
+                    "generation": row["collection_generation"],
+                    "after_generation": row["collection_generation_after"],
+                    "identity": row["collection_identity"],
+                    "before": json.loads(row["before_json"]).get("counters"),
+                    "after": json.loads(row["after_json"]).get("counters"),
+                    "receipt_hash": row["receipt_hash"],
+                }
+            )
+        try:
+            counters, expected_proof = resolve_counter_baseline(
+                context, identity, generation, edges, allow_gaps=proof_json is not None
+            )
+            if proof_json is not None and (
+                expected_proof is None
+                or json.loads(proof_json) != json.loads(expected_proof)
+            ):
+                raise ValueError("compatibility proof differs")
+        except (CompactProjectionError, ValueError, TypeError) as error:
+            raise ReceiptRegressionError(
+                "snapshot baseline proof is invalid",
+                "compact_snapshot_baseline_invalid",
+            ) from error
         current = self._compact_frame_counters(before_json)
-        if not current or any(did not in counters or counters[did] != value for did,value in current.items()):
-            raise ReceiptRegressionError('native counters do not match frozen snapshot path', 'compact_snapshot_baseline_invalid')
+        expected = {
+            did: _canonical_object_json(value, "snapshot_counters")
+            for did, value in counters.items()
+        }
+        if not current or any(
+            did not in expected or expected[did] != value
+            for did, value in current.items()
+        ):
+            raise ReceiptRegressionError(
+                "native counters do not match frozen snapshot path",
+                "compact_snapshot_baseline_invalid",
+            )
+        return expected_proof is not None
 
     def _require_compact_generation_receipt_path(
         self,

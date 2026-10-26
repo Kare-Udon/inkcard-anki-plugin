@@ -6,6 +6,24 @@ import threading
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
+from .logging_control import AddonLogger
+
+
+_LIFECYCLE_STAGES = {
+    "unregister hook": "unregister_hook",
+    "ui cleanup": "ui_cleanup",
+    "profile_did_open": "profile_did_open",
+    "profile_will_close": "profile_will_close",
+    "external collection change": "external_collection_change",
+    "addons_dialog_will_delete_addons": "addon_delete",
+    "profile_did_open startup": "startup",
+    "stop runtime (shutdown)": "shutdown",
+    "stop runtime (profile replacement)": "profile_replacement",
+    "stop runtime (failed startup)": "startup_cleanup",
+    "stop runtime (startup raced with shutdown)": "startup_shutdown_race",
+    "stop runtime (profile close)": "profile_close",
+}
+
 
 class RuntimeLike(Protocol):
     @property
@@ -34,7 +52,8 @@ class LifecycleController:
         runtime_factory: Callable[[], RuntimeLike],
         profile_provider: Callable[[], str],
         addon_id_provider: Callable[[], str | None] | None = None,
-        logger: Callable[[str], None] = print,
+        logger: Callable[[str], None] | None = None,
+        logging_core: AddonLogger | None = None,
         ui_cleanup: Callable[[], None] | None = None,
     ) -> None:
         self._gui_hooks = gui_hooks
@@ -42,6 +61,7 @@ class LifecycleController:
         self._profile_provider = profile_provider
         self._addon_id_provider = addon_id_provider or (lambda: None)
         self._logger = logger
+        self._logging_core = logging_core
         self._lock = threading.RLock()
         self._registered = False
         self._enabled = True
@@ -63,6 +83,10 @@ class LifecycleController:
     def runtime(self) -> RuntimeLike | None:
         with self._lock:
             return self._runtime
+
+    @property
+    def logging_core(self) -> AddonLogger | None:
+        return self._logging_core
 
     def set_ui_cleanup(self, cleanup: Callable[[], None] | None) -> None:
         """设置卸载时的窄 UI 清理回调；不触碰 runtime 生命周期。"""
@@ -138,6 +162,8 @@ class LifecycleController:
                 ui_cleanup()
             except Exception as exc:
                 self._report("ui cleanup", exc)
+        if self._logging_core is not None:
+            self._logging_core.close()
 
     def _on_profile_did_open(self) -> None:
         try:
@@ -249,7 +275,11 @@ class LifecycleController:
             self._report(f"stop runtime ({reason})", exc)
 
     def _report(self, action: str, exc: Exception) -> None:
-        try:
-            self._logger(f"[InkCards] {action} failed: {type(exc).__name__}: {exc}")
-        except Exception:
-            pass
+        stage = _LIFECYCLE_STAGES.get(action, "lifecycle")
+        if self._logging_core is not None:
+            self._logging_core.log_exception("lifecycle", "failure", exc, stage=stage)
+        if self._logger is not None:
+            try:
+                self._logger(f"[InkCards] {stage} failed")
+            except Exception:
+                pass

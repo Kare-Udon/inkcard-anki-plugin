@@ -33,6 +33,7 @@ class SkipReason(str, Enum):
 
     MEDIA_REFERENCE = "media_reference"
     MEDIA_ONLY = "media_only"
+    AUDIO_ONLY_SIDE = "audio_only_side"
     EMPTY_QUESTION = "empty_question"
     EMPTY_ANSWER = "empty_answer"
     UNKNOWN_TEMPLATE = "unknown_template"
@@ -291,6 +292,9 @@ class CardSnapshot:
     memory_state: Optional[MemoryState] = None
     schedule_revision: Optional[Union[int, str]] = None
     unsupported: Tuple[str, ...] = ()
+    question_blocks: Optional[Tuple[dict, ...]] = None
+    answer_blocks: Optional[Tuple[dict, ...]] = None
+    media_assets: Tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("card_id", "note_id", "deck_id"):
@@ -328,6 +332,8 @@ class CardSnapshot:
             ),
             "unsupported": list(self.unsupported),
             "supported": self.supported,
+            **({"question_blocks": list(self.question_blocks), "answer_blocks": list(self.answer_blocks),
+                "media_assets": list(self.media_assets)} if self.question_blocks is not None else {}),
         }
 
 

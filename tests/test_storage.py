@@ -102,17 +102,17 @@ class StorageTests(unittest.TestCase):
             db.commit()
         return payload
 
-    def test_v5_snapshot_migrates_to_v6_without_backfilling_context(self) -> None:
+    def test_v5_snapshot_migrates_to_v7_without_backfilling_context(self) -> None:
         root = self.root.parent / "v5-context"
         old_payload = self.create_v5_snapshot_database(root)
         migrated = ProfileStore(root, profile_id="profile-a")
         try:
             record = migrated.get_snapshot("legacy-snapshot")
-            self.assertEqual(migrated.schema_version, 6)
+            self.assertEqual(migrated.schema_version, 9)
             self.assertEqual(record.payload_json, old_payload)
             self.assertIsNone(record.application_context)
             with closing(migrated.connect()) as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0], 1)
         finally:
             migrated.close()
@@ -135,8 +135,45 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT payload_json FROM snapshots").fetchone()[0], old_payload)
             self.assertEqual(db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0], 5)
 
+    def test_v6_to_v7_artifact_migration_ddl_failure_rolls_back(self) -> None:
+        root = self.root.parent / "v6-artifact-rollback"
+        old_payload = self.create_v5_snapshot_database(root)
+        with closing(sqlite3.connect(root / "bridge.sqlite3")) as db:
+            db.execute("ALTER TABLE snapshots ADD COLUMN application_context_json TEXT")
+            db.execute("INSERT INTO schema_migrations(version,applied_at_ms) VALUES(6,6)")
+            db.execute("PRAGMA user_version=6")
+            db.commit()
+        original = migrations._v7_statements
+
+        def fail_after_artifact_ddl():
+            return tuple(original()) + ("INSERT INTO missing_artifact_migration_table VALUES(1)",)
+
+        with mock.patch.object(migrations, "_v7_statements", side_effect=fail_after_artifact_ddl):
+            with self.assertRaises(SchemaError):
+                ProfileStore(root, profile_id="profile-a")
+        with closing(sqlite3.connect(root / "bridge.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_files'"
+            ).fetchone())
+            self.assertEqual(db.execute("SELECT payload_json FROM snapshots").fetchone()[0], old_payload)
+
+    def test_schema_v7_has_artifact_allowlist(self) -> None:
+        expected = {
+            "artifact_files", "artifact_names", "artifact_slot_members",
+            "artifact_manifests", "artifact_descriptor_pages", "artifact_snapshot_files",
+            "artifact_transfers", "artifact_transfer_files", "artifact_transfer_pages",
+        }
+        with self.store.connect() as db:
+            tables = {
+                row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'artifact_%'"
+                )
+            }
+        self.assertEqual(tables, expected)
+
     def test_new_reopen_and_sqlite_pragmas(self) -> None:
-        self.assertEqual(self.store.schema_version, 6)
+        self.assertEqual(self.store.schema_version, 9)
         self.assertEqual(self.store.profile_id, "profile-a")
         with self.store.connect() as db:
             self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
@@ -195,9 +232,9 @@ class StorageTests(unittest.TestCase):
             db.commit()
         migrated = ProfileStore(v1_root, profile_id="profile-a", busy_timeout_ms=120)
         try:
-            self.assertEqual(migrated.schema_version, 6)
+            self.assertEqual(migrated.schema_version, 9)
             with migrated.connect() as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertIsNotNone(
                     db.execute(
                         "SELECT 1 FROM pragma_table_info('events') WHERE name='normalized_payload_json'"
@@ -238,9 +275,9 @@ class StorageTests(unittest.TestCase):
             db.commit()
         migrated = ProfileStore(v2_root, profile_id="profile-a")
         try:
-            self.assertEqual(migrated.schema_version, 6)
+            self.assertEqual(migrated.schema_version, 9)
             with migrated.connect() as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertIsNotNone(
                     db.execute(
                         "SELECT 1 FROM pragma_table_info('snapshots') "
@@ -285,9 +322,9 @@ class StorageTests(unittest.TestCase):
             db.commit()
         migrated = ProfileStore(v3_root, profile_id="profile-a")
         try:
-            self.assertEqual(migrated.schema_version, 6)
+            self.assertEqual(migrated.schema_version, 9)
             with migrated.connect() as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertIsNotNone(db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_events'"
                 ).fetchone())

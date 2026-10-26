@@ -11,12 +11,16 @@ import sys
 _controller = None
 
 if "aqt" in sys.modules:
-    from .inkcards_anki_bridge.plugin import register_in_anki
+    from .inkcards_anki_bridge.plugin import register_in_anki, report_startup_failure
 
     try:
         _controller = register_in_anki(addon_module_name=__name__)
     except Exception as exc:  # Anki 启动失败不应阻塞主程序
-        print(f"[InkCards] lifecycle disabled: {type(exc).__name__}: {exc}")
+        report_startup_failure(
+            exc,
+            aqt_module=sys.modules.get("aqt"),
+            addon_module_name=__name__,
+        )
 
 
 def shutdown() -> None:

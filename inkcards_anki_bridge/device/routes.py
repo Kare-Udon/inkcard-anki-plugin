@@ -10,12 +10,16 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
+import json
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from ..domain.sync_gate import LUA_SAFE_INTEGER_MAX, ImmutableReviewEvent
 from ..services.inbox import InboxService
+from ..logging_control import AddonLogger
 from ..services.snapshots import SnapshotError, SnapshotService
+from ..sync_policy import SyncPolicyError
+from ..services.snapshot_files import ArtifactError, SnapshotFilesService
 from ..storage import (
     BusyStorageError,
     CommitUnknownError,
@@ -24,6 +28,7 @@ from ..storage import (
     StorageValidationError,
 )
 from .auth import AuthError, AuthPrincipal, DeviceAuthenticator
+from .flight import save_report
 from .codec import CodecError, decode_object, encode_json, error_envelope
 
 
@@ -74,6 +79,11 @@ class DeviceRouter:
             "/v2/pull/refresh",
             "/v2/pull/page",
             "/v2/pull/commit",
+            "/v2/artifacts/open",
+            "/v2/artifacts/manifest",
+            "/v2/artifacts/file",
+            "/v2/artifacts/commit",
+            "/v2/artifacts/status",
             "/v2/override/prepare",
             "/v2/override/confirm",
         }
@@ -85,11 +95,15 @@ class DeviceRouter:
         inbox: InboxService,
         *,
         snapshot_service: Optional[SnapshotService] = None,
+        snapshot_files_service: Optional[SnapshotFilesService] = None,
         refresh_handler: Optional[Callable[..., Tuple[int, Mapping[str, Any]]]] = None,
+        ready_scope_reader: Optional[Callable[[], str]] = None,
+        sync_observer: Optional[Callable[..., None]] = None,
         compact_job_requester: Optional[Callable[[str, str], Any]] = None,
         compact_job_status_reader: Optional[Callable[[str, str], Optional[Mapping[str, Any]]]] = None,
         compact_capability_reader: Optional[Callable[[], Mapping[str, Any]]] = None,
         limits: Optional[RouteLimits] = None,
+        logger: Optional[AddonLogger] = None,
     ) -> None:
         if not isinstance(auth, DeviceAuthenticator):
             raise TypeError("auth must be a DeviceAuthenticator")
@@ -102,12 +116,23 @@ class DeviceRouter:
                 raise TypeError("snapshot_service must be a SnapshotService")
             if snapshot_service.store is not auth.store:
                 raise ValueError("snapshot service must use the same ProfileStore")
+        if snapshot_files_service is not None:
+            if not isinstance(snapshot_files_service, SnapshotFilesService):
+                raise TypeError("snapshot_files_service must be a SnapshotFilesService")
+            if snapshot_files_service.store is not auth.store:
+                raise ValueError("snapshot files service must use the same ProfileStore")
+            if snapshot_service is None:
+                raise ValueError("snapshot files service requires a snapshot service")
+        self.logger = logger or AddonLogger(auth.store.root)
         self.auth = auth
         self.inbox = inbox
         self.snapshot_service = snapshot_service
+        self.snapshot_files_service = snapshot_files_service
         if refresh_handler is not None and (snapshot_service is None or not callable(refresh_handler)):
             raise ValueError("refresh handler requires a snapshot service")
         self.refresh_handler = refresh_handler
+        self.ready_scope_reader = ready_scope_reader
+        self.sync_observer = sync_observer
         if compact_job_requester is not None and not callable(compact_job_requester):
             raise TypeError("compact_job_requester must be callable")
         if compact_job_status_reader is not None and not callable(compact_job_status_reader):
@@ -118,9 +143,12 @@ class DeviceRouter:
         self.store: ProfileStore = auth.store
         self.limits = limits or RouteLimits()
         self._review_lock = threading.RLock()
+        self._flight_lock = threading.RLock()
         self.route_table = {
             ("POST", "/v2/pair"): self._pair,
+            ("POST", "/v2/pair/confirm"): self._pair_confirm,
             ("POST", "/v2/handshake"): self._handshake,
+            ("POST", "/v2/diagnostics/report"): self._flight_report,
             ("POST", "/v2/reviews"): self._reviews,
             ("POST", "/v2/receipts"): self._receipts,
             ("POST", "/v2/sync/status"): self._status,
@@ -137,6 +165,14 @@ class DeviceRouter:
             )
         if refresh_handler is not None:
             self.route_table[("POST", "/v2/pull/refresh")] = self._pull_refresh
+        if snapshot_files_service is not None:
+            self.route_table.update({
+                ("POST", "/v2/artifacts/open"): self._artifacts_open,
+                ("POST", "/v2/artifacts/manifest"): self._artifacts_manifest,
+                ("POST", "/v2/artifacts/file"): self._artifacts_file,
+                ("POST", "/v2/artifacts/commit"): self._artifacts_commit,
+                ("POST", "/v2/artifacts/status"): self._artifacts_status,
+            })
 
     def _response(self, status: int, payload: Mapping[str, Any]) -> RouteResponse:
         try:
@@ -204,7 +240,48 @@ class DeviceRouter:
             allowed=allowed,
         )
 
+    def request_limit_for(self, method: str, path: str) -> int:
+        """artifact body 采用 64 KiB 上限，既有路由保留原配置。"""
+
+        if method.upper() == "POST" and path in {
+            "/v2/artifacts/open", "/v2/artifacts/manifest", "/v2/artifacts/file",
+            "/v2/artifacts/commit", "/v2/artifacts/status",
+        }:
+            return 64 * 1024
+        return self.limits.max_request_bytes
+
+    @staticmethod
+    def _artifact_body(
+        raw: bytes, *, required: Iterable[str], allowed: Iterable[str]
+    ) -> Dict[str, Any]:
+        return decode_object(raw, max_bytes=64 * 1024, required=required, allowed=allowed)
+
     def dispatch(
+        self, method: str, path: str, headers: Mapping[str, Any], body: bytes,
+    ) -> RouteResponse:
+        response = self._dispatch(method, path, headers, body)
+        if self.sync_observer is not None and path in {
+            "/v2/pull/refresh", "/v2/pull/open", "/v2/pull/page", "/v2/pull/commit",
+            "/v2/artifacts/open", "/v2/artifacts/manifest", "/v2/artifacts/file",
+            "/v2/artifacts/commit", "/v2/artifacts/status",
+        }:
+            if response.status >= 400 and response.status not in {401, 403}:
+                try:
+                    payload = json.loads(response.body)
+                    error = payload.get("error", "sync_failed")
+                    if isinstance(error, str):
+                        error = {"code": error}
+                    self.sync_observer("failed", error=error, request_path=path)
+                except (TypeError, ValueError):
+                    pass
+            elif response.status == 200 and path in {
+                "/v2/pull/open", "/v2/pull/page", "/v2/artifacts/open",
+                "/v2/artifacts/manifest", "/v2/artifacts/file",
+            }:
+                self.sync_observer("downloading")
+        return response
+
+    def _dispatch(
         self,
         method: str,
         path: str,
@@ -229,36 +306,46 @@ class DeviceRouter:
             return self._error(error.code, error.status, error.retryable)
         except RouteError as error:
             return self._error(error.code, error.status, error.retryable)
+        except SyncPolicyError as error:
+            return self._error(error.code, 409)
         except SnapshotError as error:
             return self._error(error.code, error.status, error.retryable)
+        except ArtifactError as error:
+            return self._error(error.code, error.status, error.retryable)
         except CommitUnknownError as error:
-            return self._error(error.code, 503, True)
+            return self._internal_exception(error, error.code, 503)
         except BusyStorageError as error:
-            return self._error(error.code, 503, True)
+            return self._internal_exception(error, "storage_busy", 503)
         except StorageValidationError as error:
             status = 409 if error.code in {"identity_mismatch", "sequence_conflict", "receipt_regression"} else 422
             return self._error(error.code, status)
         except StorageError as error:
-            return self._error(error.code, 503, True)
-        except Exception:
-            return self._error("internal_error", 500)
+            return self._internal_exception(error, error.code, 503)
+        except Exception as error:
+            return self._internal_exception(error, "internal_error", 500)
+
+    def _internal_exception(self, error, code, status):
+        if self.logger.enabled("error"):
+            self.logger.emit("error", "device", "route_failure", **self.logger.exception_fields(error, stage="route_dispatch"))
+        return self._error(code, status, status == 503)
 
     def _pair(self, _: Mapping[str, Any], raw: bytes) -> RouteResponse:
-        body = self._body(raw, required={"code", "device_id"}, allowed={"code", "device_id", "name"})
+        body = self._body(raw, required={"code", "device_id"}, allowed={"code", "device_id", "pairing_id", "token", "name"})
+        # 旧阅读器的六位码请求也能收到明确升级提示，但不能完成配对。
         code = body["code"]
-        device_id = self._text(body["device_id"], code="invalid_pair_request", maximum=128)
-        if "name" in body:
-            self._text(body["name"], code="invalid_pair_request", maximum=128)
-        credential = self.auth.pair(code, device_id)
-        return self._response(
-            200,
-            {
-                "protocol": "x4-2",
-                "profile_id": credential.profile_id,
-                "device_id": credential.device_id,
-                "token": credential.token,
-            },
-        )
+        if isinstance(code, str) and len(code) == 6 and code.isascii() and code.isdigit():
+            raise AuthError("pairing_code_upgrade_required", status=401)
+        if not {"pairing_id", "token"}.issubset(body):
+            raise RouteError("pairing_transaction_required", status=400)
+        return self._response(200, self.auth.prepare_pairing(**body))
+
+    def _pair_confirm(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._body(raw, required={"device_id", "pairing_id"}, allowed={"device_id", "pairing_id"})
+        value = self.auth._header(headers, "Authorization")
+        parts = value.split(" ") if isinstance(value, str) else []
+        if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
+            raise AuthError("bearer_token_required")
+        return self._response(200, self.auth.confirm_pairing(body["device_id"], body["pairing_id"], parts[1]))
 
     def _authenticated(
         self,
@@ -280,6 +367,19 @@ class DeviceRouter:
         if require_session:
             return principal, session_id
         return principal, session_id
+
+    def _flight_report(self, headers, raw):
+        body = decode_object(raw, max_bytes=8192, required={"device_id", "session_id", "report"}, allowed={"device_id", "session_id", "report"})
+        principal, session_id = self._authenticated(headers, body)
+        self.store._read(lambda db: self.store._require_session(db, principal.device_id, session_id))
+        try:
+            with self._flight_lock:
+                save_report(self.store.root, body["report"])
+        except (ValueError, TypeError):
+            raise RouteError("flight_report_invalid")
+        except OSError:
+            raise RouteError("flight_report_write_failed", status=503)
+        return self._response(200, {"received": True, "events": len(body["report"]["events"])})
 
     def _handshake(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
         body = self._body(
@@ -327,6 +427,7 @@ class DeviceRouter:
                     "sync_status": True,
                     "pull": self.snapshot_service is not None,
                     "pull_refresh": self.refresh_handler is not None,
+                    "snapshot_files_v1": self.snapshot_files_service is not None,
                     "override": False,
                     "compact_application": self._compact_capabilities(),
                 },
@@ -496,6 +597,152 @@ class DeviceRouter:
             snapshot_generation=body.get("snapshot_generation"),
             scope_generation=body.get("scope_generation"),
         )
+        if self.sync_observer is not None and result.get("committed") is True:
+            self.sync_observer("committed", device_id=body["device_id"], session_id=body["session_id"],
+                               snapshot_id=result.get("snapshot_id"))
+        return self._response(200, result)
+
+    def _artifact_gate(self, device_id: str, session_id: str) -> None:
+        gate = self.store.pull_gate(device_id, session_id)
+        if not gate.allowed:
+            raise RouteError(gate.reason or "pull_gate_blocked", status=409)
+
+    def _artifacts_open(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._artifact_body(
+            raw,
+            required={"device_id", "session_id", "scope_id", "local_generation", "snapshot_id"},
+            allowed={
+                "device_id", "session_id", "scope_id", "local_generation", "snapshot_id",
+                "profile_id", "generation", "snapshot_generation", "scope_generation",
+                "applied_watermark", "known_watermark", "known_file_ids",
+            },
+        )
+        principal, session_id = self._authenticated(headers, body)
+        service = self.snapshot_files_service
+        if service is None:
+            raise RouteError("capability_unavailable", status=503)
+        scope_id = self._text(body["scope_id"], code="invalid_scope_id", maximum=128)
+        snapshot_id = self._text(body["snapshot_id"], code="invalid_snapshot_id", maximum=256)
+        local_generation = body["local_generation"]
+        if (
+            isinstance(local_generation, bool)
+            or not isinstance(local_generation, int)
+            or not 0 <= local_generation <= LUA_SAFE_INTEGER_MAX
+        ):
+            raise RouteError("invalid_local_generation")
+        profile_id = body.get("profile_id")
+        if profile_id is not None:
+            profile_id = self._text(profile_id, code="invalid_profile_id", maximum=128)
+        expected_generation = SnapshotService._generation(
+            body.get("generation"), body.get("snapshot_generation"), body.get("scope_generation")
+        )
+        requested_watermark = body.get("applied_watermark", body.get("known_watermark"))
+        with self._review_lock:
+            self._artifact_gate(principal.device_id, session_id)
+            if requested_watermark is not None:
+                if "applied_watermark" not in body and isinstance(requested_watermark, str):
+                    if not requested_watermark.isascii() or not requested_watermark.isdigit():
+                        raise RouteError("invalid_applied_watermark")
+                    normalized_watermark = int(requested_watermark)
+                    if normalized_watermark > LUA_SAFE_INTEGER_MAX:
+                        raise RouteError("invalid_applied_watermark")
+                else:
+                    normalized_watermark = SnapshotService._watermark(requested_watermark)
+                gate = self.store.pull_gate(principal.device_id, session_id)
+                if normalized_watermark != (gate.applied_watermark or 0):
+                    raise RouteError("applied_watermark_mismatch", status=409)
+            result = service.open_transfer(
+                device_id=principal.device_id,
+                session_id=session_id,
+                snapshot_id=snapshot_id,
+                scope_id=scope_id,
+                known_file_ids=body.get("known_file_ids"),
+                expected_profile_id=profile_id,
+                expected_generation=expected_generation,
+            )
+        return self._response(200, result)
+
+    def _artifacts_manifest(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._artifact_body(
+            raw,
+            required={"device_id", "session_id", "transfer_id", "page_index"},
+            allowed={"device_id", "session_id", "transfer_id", "page_index"},
+        )
+        principal, session_id = self._authenticated(headers, body)
+        service = self.snapshot_files_service
+        if service is None:
+            raise RouteError("capability_unavailable", status=503)
+        transfer_id = self._text(body["transfer_id"], code="invalid_transfer_id", maximum=128)
+        raw_page = service.manifest_page(
+            device_id=principal.device_id, session_id=session_id,
+            transfer_id=transfer_id, page_index=body["page_index"],
+        )
+        return RouteResponse(200, raw_page, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Length": str(len(raw_page)),
+            "Connection": "close",
+        })
+
+    def _artifacts_file(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._artifact_body(
+            raw,
+            required={"device_id", "session_id", "transfer_id", "file_id"},
+            allowed={"device_id", "session_id", "transfer_id", "file_id"},
+        )
+        principal, session_id = self._authenticated(headers, body)
+        service = self.snapshot_files_service
+        if service is None:
+            raise RouteError("capability_unavailable", status=503)
+        package = service.file(
+            device_id=principal.device_id, session_id=session_id,
+            transfer_id=self._text(body["transfer_id"], code="invalid_transfer_id", maximum=128),
+            file_id=body["file_id"],
+        )
+        return RouteResponse(200, package, {
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(package)),
+            "Connection": "close",
+        })
+
+    def _artifacts_commit(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._artifact_body(
+            raw,
+            required={"device_id", "session_id", "transfer_id", "commit_key"},
+            allowed={"device_id", "session_id", "transfer_id", "commit_key", "present_file_ids"},
+        )
+        principal, session_id = self._authenticated(headers, body)
+        service = self.snapshot_files_service
+        if service is None:
+            raise RouteError("capability_unavailable", status=503)
+        with self._review_lock:
+            result = service.commit(
+                device_id=principal.device_id, session_id=session_id,
+                transfer_id=self._text(body["transfer_id"], code="invalid_transfer_id", maximum=128),
+                commit_key=body["commit_key"], present_file_ids=body.get("present_file_ids"),
+            )
+        if self.sync_observer is not None and result.get("status") == "committed":
+            self.sync_observer("committed", device_id=body["device_id"], session_id=body["session_id"],
+                               transfer_id=body["transfer_id"], snapshot_id=result.get("snapshot_id"))
+        return self._response(200, result)
+
+    def _artifacts_status(self, headers: Mapping[str, Any], raw: bytes) -> RouteResponse:
+        body = self._artifact_body(
+            raw,
+            required={"device_id", "session_id", "transfer_id", "commit_key"},
+            allowed={"device_id", "session_id", "transfer_id", "commit_key"},
+        )
+        principal, session_id = self._authenticated(headers, body)
+        service = self.snapshot_files_service
+        if service is None:
+            raise RouteError("capability_unavailable", status=503)
+        result = service.status(
+            device_id=principal.device_id, session_id=session_id,
+            transfer_id=self._text(body["transfer_id"], code="invalid_transfer_id", maximum=128),
+            commit_key=body["commit_key"],
+        )
+        if self.sync_observer is not None and result.get("status") == "committed":
+            self.sync_observer("committed", device_id=body["device_id"], session_id=body["session_id"],
+                               transfer_id=body["transfer_id"], snapshot_id=result.get("snapshot_id"))
         return self._response(200, result)
 
     @staticmethod
@@ -838,11 +1085,17 @@ class DeviceRouter:
             },
             "last_error": reasons[-1] if reasons else None,
             "ready_scope_id": (
-                self.store.latest_current_scope_id()
+                self.ready_scope_reader() if self.ready_scope_reader is not None else self.store.latest_current_scope_id()
                 if self.snapshot_service is not None
                 else None
             ),
         }
+        # 持久事件仍是 not_applied 时，宿主作业也可能已经终止，不能继续宣称等待中。
+        if compact_pending and compact_job is not None:
+            job_state = compact_job.get("state")
+            if job_state in {"blocked", "conflict", "failed", "canceled", "stale_result_dropped", "unavailable", "unknown"}:
+                response_payload["phase"] = "reconcile_application" if job_state == "unknown" else "blocked"
+                response_payload["last_error"] = compact_job.get("reason") or "compact_application_blocked"
         response_payload["compact_application_capability"] = self._compact_capabilities()
         if self.compact_job_status_reader is not None or self.compact_job_requester is not None:
             response_payload["compact_job"] = compact_job

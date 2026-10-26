@@ -567,6 +567,7 @@ def create_apply_authorization(
     legacy_source: Optional[Mapping[str, Any]] = None,
     predecessor_after: Optional[Mapping[str, Any]] = None,
     expected_counters: Optional[Mapping[str, Any]] = None,
+    baseline_proof_json: Optional[str] = None,
 ) -> CompactApplyAuthorization:
     """Create an event-bound policy claim using read-only native state."""
 
@@ -669,6 +670,21 @@ def create_apply_authorization(
     except CompactProjectionError as exc:
         raise CompactNativeError(exc.code, exc.message) from exc
 
+    if baseline_proof_json is not None:
+        # 完整历史也必须能追溯，不能用 cached last_review_time 代替历史证据。
+        expected_history = application_context.source.card_review_log_hashes.get(str(card_id))
+        if expected_history is None:
+            expected_history = application_context.source.card_last_review_time_sources.get(str(card_id), {}).get("revlog_sha256")
+        if predecessor_after is not None and not _snapshot_supersedes_predecessor(predecessor_after, application_context):
+            expected_history = predecessor_after.get("native_revlogs_sha256")
+        if expected_history is None:
+            raise CompactNativeError("compatibility_history_unproven", "旧快照缺少完整历史摘要，不能跨版本授权")
+        observed_history = json_sha256([list(row) for row in collection.db.all(
+            "SELECT id,cid,usn,ease,ivl,lastIvl,factor,time,type FROM revlog WHERE cid=? ORDER BY id", card_id
+        )])
+        if observed_history != expected_history:
+            raise CompactNativeError("snapshot_last_review_source_conflict", "版本间隙中的完整复习历史已变化")
+
     _, verified_counters = _verify_snapshot_deck_context(
         collection, snapshot_map, deck_id, application_context,
         collection_generation, expected_counters,
@@ -736,6 +752,8 @@ def create_apply_authorization(
         "native_card_sha256": json_sha256(_capture_native_card_hex(collection, card_id)),
         "verified_counters_sha256": json_sha256(verified_counters),
     }
+    if baseline_proof_json is not None:
+        authorization_body["baseline_proof_json"] = baseline_proof_json
     return CompactApplyAuthorization(
         mode=mode,  # type: ignore[arg-type]
         policy_id=policy_id,
@@ -751,6 +769,7 @@ def create_apply_authorization(
         source_id=source_id,
         source_sha256=source_hash,
         evidence_sha256=json_sha256(authorization_body),
+        baseline_proof_json=baseline_proof_json,
     )
 
 
@@ -1235,6 +1254,7 @@ class AnkiCompactAdapter:
             else None,
             predecessor_after=predecessor_after,
             expected_counters=expected_counters,
+            baseline_proof_json=authorization.baseline_proof_json,
         )
         if recalculated != authorization:
             raise CompactNativeError("authorization_stale", "read-only authorization no longer matches the event")

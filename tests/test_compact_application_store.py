@@ -605,7 +605,7 @@ class CompactApplicationStoreTests(unittest.TestCase):
             ).fetchall()]
         migrated = ProfileStore(root, profile_id="profile-a")
         try:
-            self.assertEqual(migrated.schema_version, 6)
+            self.assertEqual(migrated.schema_version, 9)
             self.assertEqual(len(migrated.query_compact_events("device-a", "session-a")), 6)
             self.assertEqual([row.status for row in migrated.query_compact_applications("device-a", "session-a")],
                              ["not_applied"] * 6)
@@ -617,7 +617,7 @@ class CompactApplicationStoreTests(unittest.TestCase):
             self.assertEqual(migrated.query_receipts("device-a", "session-a")[0].status, "received")
             self.assertEqual(migrated.query_applications("device-a", "session-a")[0].status, "pending_apply")
             with sqlite_connection(migrated.connect()) as db:
-                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM applications").fetchone()[0], 1)
                 self.assertEqual([tuple(row) for row in db.execute("SELECT * FROM compact_events ORDER BY sequence").fetchall()], before_rows)
                 self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
@@ -644,7 +644,7 @@ class CompactApplicationStoreTests(unittest.TestCase):
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='compact_applications'"
             ).fetchone())
         reopened = ProfileStore(rollback_root, profile_id="profile-a")
-        self.assertEqual(reopened.schema_version, 6)
+        self.assertEqual(reopened.schema_version, 9)
         reopened.close()
 
         unknown_root = self.base / "unknown"
@@ -1089,8 +1089,8 @@ class CompactApplicationStoreTests(unittest.TestCase):
                 return response.status, json.loads(response.body)
 
             code = auth.issue_pairing_code()
-            _, pair = call("/v2/pair", {"code": code, "device_id": "device-status"})
-            headers = {"Authorization": "Bearer " + pair["token"]}
+            credential = auth.pair(code, "device-status")
+            headers = {"Authorization": "Bearer " + credential.token}
             call("/v2/handshake", {
                 "protocol": "x4-2", "device_id": "device-status", "session_id": "session-status"
             }, headers)

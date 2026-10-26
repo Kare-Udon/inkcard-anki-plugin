@@ -8,8 +8,8 @@ from typing import Set
 
 from .errors import SchemaError, UnsupportedSchemaError
 
-SCHEMA_VERSION = 6
-SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6)
+SCHEMA_VERSION = 9
+SUPPORTED_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 
 _V1_TABLES = {
     "profile_meta",
@@ -32,6 +32,17 @@ _V5_TABLES = _V4_TABLES | {
     "compact_applications",
     "compact_score_evidence",
     "card_apply_locks",
+}
+_V7_TABLES = _V5_TABLES | {
+    "artifact_files",
+    "artifact_names",
+    "artifact_slot_members",
+    "artifact_manifests",
+    "artifact_descriptor_pages",
+    "artifact_snapshot_files",
+    "artifact_transfers",
+    "artifact_transfer_files",
+    "artifact_transfer_pages",
 }
 
 
@@ -425,6 +436,175 @@ def _v6_statements() -> Iterable[str]:
     return ("ALTER TABLE snapshots ADD COLUMN application_context_json TEXT",)
 
 
+def _v7_statements() -> Iterable[str]:
+    """添加有界不可变文件包、快照引用与传输收据。"""
+
+    return (
+        """
+        CREATE TABLE artifact_files (
+            profile_id TEXT NOT NULL,
+            file_id TEXT NOT NULL CHECK(length(file_id) = 64),
+            name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+            kind TEXT NOT NULL CHECK(kind IN ('text','schedule','index')),
+            bytes INTEGER NOT NULL CHECK(bytes > 0 AND bytes <= 98304),
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+            record_count INTEGER NOT NULL CHECK(record_count > 0),
+            package BLOB NOT NULL,
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            PRIMARY KEY(profile_id,file_id),
+            UNIQUE(profile_id,name),
+            FOREIGN KEY(profile_id) REFERENCES profile_meta(profile_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_slot_members (
+            profile_id TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('text','schedule')),
+            slot_index INTEGER NOT NULL CHECK(slot_index >= 0),
+            record_index INTEGER NOT NULL CHECK(record_index >= 1),
+            card_id TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY(profile_id,scope_id,kind,card_id),
+            UNIQUE(profile_id,scope_id,kind,slot_index,record_index),
+            FOREIGN KEY(profile_id) REFERENCES profile_meta(profile_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_manifests (
+            profile_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            root_json TEXT NOT NULL,
+            descriptor_page_count INTEGER NOT NULL CHECK(descriptor_page_count >= 0),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            PRIMARY KEY(profile_id,snapshot_id),
+            FOREIGN KEY(profile_id,snapshot_id) REFERENCES snapshots(profile_id,snapshot_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_descriptor_pages (
+            profile_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            page_index INTEGER NOT NULL CHECK(page_index >= 0),
+            file_id TEXT NOT NULL CHECK(length(file_id) = 64),
+            name TEXT NOT NULL,
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+            bytes INTEGER NOT NULL CHECK(bytes > 0 AND bytes <= 32768),
+            page_json BLOB NOT NULL,
+            PRIMARY KEY(profile_id,snapshot_id,page_index),
+            FOREIGN KEY(profile_id,snapshot_id) REFERENCES snapshots(profile_id,snapshot_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_snapshot_files (
+            profile_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            file_id TEXT NOT NULL CHECK(length(file_id) = 64),
+            kind TEXT NOT NULL CHECK(kind IN ('text','schedule','index')),
+            name TEXT NOT NULL,
+            bytes INTEGER NOT NULL CHECK(bytes > 0 AND bytes <= 98304),
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64),
+            record_count INTEGER NOT NULL CHECK(record_count > 0),
+            PRIMARY KEY(profile_id,snapshot_id,file_id),
+            FOREIGN KEY(profile_id,snapshot_id) REFERENCES snapshots(profile_id,snapshot_id) ON DELETE CASCADE,
+            FOREIGN KEY(profile_id,file_id) REFERENCES artifact_files(profile_id,file_id)
+        )
+        """,
+        """
+        CREATE TABLE artifact_transfers (
+            profile_id TEXT NOT NULL,
+            transfer_id TEXT NOT NULL CHECK(length(transfer_id) BETWEEN 1 AND 128),
+            device_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation >= 0),
+            known_watermark INTEGER NOT NULL CHECK(known_watermark >= 0),
+            snapshot_checksum TEXT NOT NULL CHECK(length(snapshot_checksum) = 64),
+            context_json TEXT NOT NULL,
+            manifest_hash TEXT NOT NULL CHECK(length(manifest_hash) = 64),
+            commit_key TEXT,
+            present_file_ids_json TEXT,
+            receipt_json TEXT,
+            status TEXT NOT NULL CHECK(status IN ('prepared','committed')),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+            PRIMARY KEY(profile_id,transfer_id),
+            UNIQUE(profile_id,device_id,session_id,transfer_id),
+            FOREIGN KEY(profile_id,snapshot_id) REFERENCES snapshots(profile_id,snapshot_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_transfer_files (
+            profile_id TEXT NOT NULL,
+            transfer_id TEXT NOT NULL,
+            file_id TEXT NOT NULL CHECK(length(file_id) = 64),
+            known INTEGER NOT NULL CHECK(known IN (0,1)),
+            served INTEGER NOT NULL DEFAULT 0 CHECK(served IN (0,1)),
+            PRIMARY KEY(profile_id,transfer_id,file_id),
+            FOREIGN KEY(profile_id,transfer_id) REFERENCES artifact_transfers(profile_id,transfer_id) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE artifact_transfer_pages (
+            profile_id TEXT NOT NULL,
+            transfer_id TEXT NOT NULL,
+            page_index INTEGER NOT NULL CHECK(page_index >= 0),
+            served INTEGER NOT NULL DEFAULT 0 CHECK(served IN (0,1)),
+            PRIMARY KEY(profile_id,transfer_id,page_index),
+            FOREIGN KEY(profile_id,transfer_id) REFERENCES artifact_transfers(profile_id,transfer_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX artifact_transfers_identity_idx ON artifact_transfers(profile_id,device_id,session_id,snapshot_id)",
+        """
+        CREATE TABLE artifact_names (
+            profile_id TEXT NOT NULL,
+            name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+            file_id TEXT NOT NULL CHECK(length(file_id) = 64),
+            kind TEXT NOT NULL CHECK(kind IN ('text','schedule','index')),
+            PRIMARY KEY(profile_id,name),
+            FOREIGN KEY(profile_id) REFERENCES profile_meta(profile_id) ON DELETE CASCADE
+        )
+        """,
+    )
+
+
+def _v8_statements() -> Iterable[str]:
+    """设备名额与待确认凭据独立于历史业务身份。"""
+
+    return (
+        """CREATE TABLE device_slots (
+            profile_id TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+            status TEXT NOT NULL CHECK(status IN ('pending','bound','rebind_ready','revoked')),
+            code_hash TEXT CHECK(code_hash IS NULL OR length(code_hash)=64),
+            device_id TEXT,
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+            PRIMARY KEY(profile_id,slot_id),
+            UNIQUE(profile_id,code_hash),
+            FOREIGN KEY(profile_id) REFERENCES profile_meta(profile_id)
+        )""",
+        "CREATE UNIQUE INDEX device_slots_bound_identity ON device_slots(profile_id,device_id) WHERE status!='revoked' AND device_id IS NOT NULL",
+        """CREATE TABLE pairing_transactions (
+            profile_id TEXT NOT NULL,
+            pairing_id TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL CHECK(length(token_hash)=64),
+            status TEXT NOT NULL CHECK(status IN ('pending','active')),
+            created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0),
+            PRIMARY KEY(profile_id,pairing_id),
+            UNIQUE(profile_id,slot_id),
+            UNIQUE(profile_id,token_hash),
+            FOREIGN KEY(profile_id,slot_id) REFERENCES device_slots(profile_id,slot_id)
+        )""",
+        "INSERT INTO device_slots(profile_id,slot_id,name,status,code_hash,device_id,created_at_ms) "
+        "SELECT profile_id,'legacy_' || lower(hex(randomblob(16))),device_id,"
+        "CASE WHEN revoked_at_ms IS NULL THEN 'bound' ELSE 'revoked' END,NULL,device_id,created_at_ms FROM devices",
+    )
+
+
 def _table_names(db: sqlite3.Connection) -> Set[str]:
     """读取 SQLite 用户表名。"""
 
@@ -453,6 +633,10 @@ def validate_schema(db: sqlite3.Connection, version: int) -> None:
         expected_tables = _V3_TABLES
     elif version == 4:
         expected_tables = _V4_TABLES
+    elif version >= 8:
+        expected_tables = _V7_TABLES | {"device_slots", "pairing_transactions"}
+    elif version >= 7:
+        expected_tables = _V7_TABLES
     else:
         expected_tables = _V5_TABLES
     actual_tables = _table_names(db)
@@ -672,11 +856,58 @@ def validate_schema(db: sqlite3.Connection, version: int) -> None:
         }
     if version >= 6:
         expected_columns["snapshots"].add("application_context_json")
+    if version >= 7:
+        expected_columns.update({
+            "artifact_files": {"profile_id", "file_id", "name", "kind", "bytes", "sha256", "record_count", "package", "created_at_ms"},
+            "artifact_names": {"profile_id", "name", "file_id", "kind"},
+            "artifact_slot_members": {"profile_id", "scope_id", "kind", "slot_index", "record_index", "card_id", "record_json"},
+            "artifact_manifests": {"profile_id", "snapshot_id", "root_json", "descriptor_page_count", "created_at_ms"},
+            "artifact_descriptor_pages": {"profile_id", "snapshot_id", "page_index", "file_id", "name", "sha256", "bytes", "page_json"},
+            "artifact_snapshot_files": {"profile_id", "snapshot_id", "file_id", "kind", "name", "bytes", "sha256", "record_count"},
+            "artifact_transfers": {"profile_id", "transfer_id", "device_id", "session_id", "snapshot_id", "scope_id", "generation", "known_watermark", "snapshot_checksum", "context_json", "manifest_hash", "commit_key", "present_file_ids_json", "receipt_json", "status", "created_at_ms", "updated_at_ms"},
+            "artifact_transfer_files": {"profile_id", "transfer_id", "file_id", "known", "served"},
+            "artifact_transfer_pages": {"profile_id", "transfer_id", "page_index", "served"},
+        })
+    if version >= 8:
+        expected_columns.update({
+            "device_slots": {"profile_id", "slot_id", "name", "status", "code_hash", "device_id", "created_at_ms"},
+            "pairing_transactions": {"profile_id", "pairing_id", "slot_id", "device_id", "token_hash", "status", "created_at_ms"},
+        })
     for table, columns in expected_columns.items():
         if _columns(db, table) != columns:
             raise SchemaError(
                 "table columns do not match allowlist", "schema_columns_mismatch"
             )
+
+
+def _migrate_media_types(db: sqlite3.Connection, now_ms: int) -> None:
+    """重建旧版 CHECK 约束；不删除文件、传输、收据或配对行。"""
+    db.execute("PRAGMA foreign_keys=OFF")
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        names = ("artifact_files", "artifact_names", "artifact_snapshot_files")
+        for name in names:
+            sql = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+            if "'media'" in sql:
+                continue  # 兼容早期隔离候选已扩展约束的 v8。
+            updated = sql.replace("('text','schedule','index')", "('text','schedule','index','media')")
+            if updated == sql:
+                raise SchemaError("unexpected artifact kind constraint", "schema_media_constraint_invalid")
+            temporary = name + "_media_v9"
+            db.execute(updated.replace("CREATE TABLE " + name, "CREATE TABLE " + temporary, 1))
+            db.execute("INSERT INTO " + temporary + " SELECT * FROM " + name)
+            db.execute("DROP TABLE " + name)
+            db.execute("ALTER TABLE " + temporary + " RENAME TO " + name)
+        if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise SchemaError("media migration foreign key check failed", "schema_media_foreign_key_invalid")
+        db.execute("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(9, ?)", (now_ms,))
+        db.execute("PRAGMA user_version=9")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute("PRAGMA foreign_keys=ON")
 
 
 def apply_migrations(db: sqlite3.Connection, now_ms: int) -> None:
@@ -800,5 +1031,38 @@ def apply_migrations(db: sqlite3.Connection, now_ms: int) -> None:
             db.rollback()
             raise
         version = 6
+
+    if version == 6:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _v7_statements():
+                db.execute(statement)
+            db.execute(
+                "INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
+                (7, now_ms),
+            )
+            db.execute("PRAGMA user_version=7")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        version = 7
+
+    if version == 7:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in _v8_statements():
+                db.execute(statement)
+            db.execute("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)", (8, now_ms))
+            db.execute("PRAGMA user_version=8")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        version = 8
+
+    if version == 8:
+        _migrate_media_types(db, now_ms)
+        version = 9
 
     validate_schema(db, version)

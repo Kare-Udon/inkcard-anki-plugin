@@ -7,6 +7,7 @@ import socket
 import stat
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from inkcards_anki_bridge.device.server import ServerLimits
@@ -98,9 +99,15 @@ class AddonRuntimeTests(unittest.TestCase):
 
     def pair(self) -> tuple[str, str]:
         code = self.runtime.issue_pairing_code()
-        status, body = self.request("/v2/pair", {"code": code, "device_id": "device-a"})
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        pairing_id = str(uuid.uuid4())
+        status, body = self.request("/v2/pair", {"code": code, "device_id": "device-a", "pairing_id": pairing_id, "token": token})
         self.assertEqual(status, 200)
-        return body["device_id"], body["token"]
+        self.assertEqual(body["status"], "pending")
+        status, body = self.request("/v2/pair/confirm", {"device_id": "device-a", "pairing_id": pairing_id}, token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "active")
+        return body["device_id"], token
 
     def test_start_status_pair_revoke_and_stop_are_bounded(self) -> None:
         first_epoch = self.runtime.runtime_epoch
@@ -246,6 +253,7 @@ class AddonRuntimeTests(unittest.TestCase):
 
     def test_bridge_name_is_only_a_compatibility_alias_for_new_runtime(self) -> None:
         self.assertIs(BridgeRuntime, AddonRuntime)
+
 
 
 if __name__ == "__main__":

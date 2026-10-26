@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import threading
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +16,7 @@ from inkcards_anki_bridge.services.snapshots import SnapshotError
 
 
 class FakeServer:
-    def __init__(self, _router, *, host, port, limits=None):
+    def __init__(self, _router, *, host, port, limits=None, request_log=None):
         self.server_address = (host, 39123)
 
     def start(self):
@@ -60,6 +61,54 @@ def snapshot(day: int) -> TypedSnapshot:
 
 
 class PullRefreshRuntimeTests(unittest.TestCase):
+    def test_bound_progress_poll_returns_pending_while_publication_holds_runtime_lock(self):
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "inkcards_anki_bridge.runtime.DeviceServer", FakeServer
+        ):
+            runtime = AddonRuntime(profile_id='profile-a', root=Path(temp), port=0).start()
+            entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+            results = []
+            try:
+                runtime.store.register_device('device-a', 'device-token-a')
+                runtime.store.open_session('device-a', 'session-a')
+                scope = make_scope(card_ids=None, deck_ids=['20']).scope_id
+                runtime.snapshots.publish(snapshot(42), scope_id=scope,
+                    source_scope={'kind': 'deck', 'ids': ['20']})
+                runtime.attach_snapshot_jobs(FakeManager())
+                args = dict(device_id='device-a', session_id='session-a', scope_id=scope)
+                _, pending = runtime.refresh_pull(**args)
+                def publish_lock():
+                    with runtime._lock:
+                        entered.set()
+                        release.wait(2)
+                def poll():
+                    results.append(runtime.refresh_pull(**args, refresh_token=pending['refresh_token']))
+                    completed.set()
+                holder = threading.Thread(target=publish_lock)
+                holder.start()
+                self.assertTrue(entered.wait(1))
+                reader = threading.Thread(target=poll)
+                reader.start()
+                try:
+                    self.assertTrue(completed.wait(.3), '进度轮询不应等待发布锁')
+                    for changed in ({'device_id': 'other'}, {'session_id': 'other'},
+                                    {'scope_id': 'other'}, {'base_snapshot_id': 'other'}):
+                        with self.subTest(changed=changed), self.assertRaises(SnapshotError) as raised:
+                            runtime.refresh_pull(**{**args, **changed}, refresh_token=pending['refresh_token'])
+                        self.assertEqual(raised.exception.code, 'snapshot_refresh_token_invalid')
+                    with self.assertRaises(SnapshotError) as raised:
+                        runtime.refresh_pull(**args)
+                    self.assertEqual(raised.exception.code, 'snapshot_refresh_busy')
+                finally:
+                    release.set()
+                    holder.join(2)
+                    reader.join(2)
+                self.assertEqual(results[0][0], 202)
+                self.assertEqual(results[0][1]['state'], 'pending')
+            finally:
+                release.set()
+                runtime.stop()
+
     def test_full_snapshot_job_queue_returns_retryable_busy(self):
         with tempfile.TemporaryDirectory() as temp, patch(
             "inkcards_anki_bridge.runtime.DeviceServer", FakeServer

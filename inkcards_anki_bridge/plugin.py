@@ -19,7 +19,8 @@ from .anki.operations import (
 )
 from .anki.snapshot_jobs import SnapshotJobManager
 from .lifecycle import LifecycleController
-from .profile_identity import load_or_create_profile_identity
+from .logging_control import AddonLogger, logging_policy_from_config, normalize_logging_policy
+from .profile_identity import load_or_create_profile_identity, profile_namespace
 from .runtime import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -182,6 +183,112 @@ def write_device_server_host(
     return current
 
 
+def write_logging_policy(
+    *,
+    aqt_module: Any,
+    addon_module_name: str,
+    policy: Any,
+    logger: AddonLogger | None = None,
+    runtime_provider: Any = None,
+) -> Mapping[str, Any]:
+    """持久化策略成功后才热更新 logger；失败时当前策略保持不变。"""
+
+    main_window = getattr(aqt_module, "mw", None)
+    manager = getattr(main_window, "addonManager", None)
+    addon_id = _addon_id(main_window, addon_module_name)
+    if manager is None or addon_id is None:
+        raise RuntimeError("Anki add-on configuration manager is unavailable")
+    current = dict(_addon_config(main_window, addon_id, None))
+    selected = normalize_logging_policy(policy)
+    current["logging"] = selected
+    writer = getattr(manager, "writeConfig", None)
+    if not callable(writer):
+        writer = getattr(manager, "setConfig", None)
+    if not callable(writer):
+        raise RuntimeError("Anki add-on configuration writer is unavailable")
+    writer(addon_id, current)
+    if logger is not None:
+        runtime = runtime_provider() if callable(runtime_provider) else None
+        configure = getattr(runtime, "configure_logging", None)
+        if callable(configure):
+            configure(selected)
+        else:
+            logger.configure(selected)
+    return current
+
+
+def _initial_logging_core(
+    *,
+    main_window: Any,
+    addon_root: Path,
+    addon_id: str | None,
+    user_files_root: str | Path | None,
+    config: Mapping[str, Any] | None,
+    existing: AddonLogger | None = None,
+) -> AddonLogger:
+    selected = _addon_config(main_window, addon_id, config)
+    root: Path | None = None
+    try:
+        profile_folder = _profile_folder(main_window)
+        identity_root = Path(user_files_root) if user_files_root is not None else addon_root / "user_files"
+        root = identity_root / "profiles" / profile_namespace(profile_folder)
+    except Exception:
+        pass
+    core = existing or AddonLogger(root, policy=logging_policy_from_config(selected))
+    if existing is not None:
+        core.configure(logging_policy_from_config(selected), root=root)
+    return core
+
+
+def report_startup_failure(
+    error: BaseException,
+    *,
+    aqt_module: Any | None = None,
+    addon_module_name: str | None = None,
+    user_files_root: str | Path | None = None,
+) -> bool:
+    """在 profile 日志可用时安全记录入口启动失败；否则静默返回。"""
+
+    logging_core: AddonLogger | None = None
+    try:
+        if aqt_module is None:
+            import aqt as aqt_module  # type: ignore[no-redef]
+        main_window = getattr(aqt_module, "mw", None)
+        if main_window is None:
+            return False
+
+        module_name = addon_module_name or __name__
+        try:
+            addon_id = _addon_id(main_window, module_name)
+        except Exception:
+            addon_id = None
+        try:
+            addon_root = _addon_root(main_window, addon_id)
+        except Exception:
+            addon_root = Path(__file__).resolve().parents[1]
+
+        logging_core = _initial_logging_core(
+            main_window=main_window,
+            addon_root=addon_root,
+            addon_id=addon_id,
+            user_files_root=user_files_root,
+            config=None,
+        )
+        if logging_core.root is None:
+            return False
+        return logging_core.log_exception(
+            "lifecycle", "startup_failed", error, stage="startup"
+        )
+    except Exception:
+        return False
+    finally:
+        if logging_core is not None:
+            try:
+                logging_core.close()
+            except Exception:
+                pass
+
+
 def _query_op_factory(aqt_module: Any) -> Any:
     """只在 Anki 入口解析官方 QueryOp；普通 Python import 不触碰 aqt。"""
 
@@ -258,7 +365,7 @@ def _attach_compact_jobs(
     adapter = AnkiCompactAdapter()
     from .anki.compact_diagnostics import CompactDiagnostics
 
-    diagnostics = CompactDiagnostics(store.root)
+    diagnostics = CompactDiagnostics(store.root, logger=getattr(runtime, "logging_core", None))
     service = CompactApplicationService(store, adapter, diagnostics=diagnostics)
     capability_writer = getattr(runtime, "set_compact_capability", None)
     if callable(capability_writer):
@@ -437,6 +544,7 @@ def start_in_anki(
     port: int | None = None,
     route_limits: Any = None,
     server_limits: Any = None,
+    logging_core: AddonLogger | None = None,
 ) -> AddonRuntime:
     """在 profile 已打开后创建并启动当前 profile 的新 runtime。"""
 
@@ -471,6 +579,11 @@ def start_in_anki(
         else addon_root / "user_files"
     )
     identity = load_or_create_profile_identity(identity_root, profile_folder)
+    selected_logging = logging_policy_from_config(selected_config)
+    if logging_core is None:
+        logging_core = AddonLogger(identity.root, policy=selected_logging)
+    else:
+        logging_core.configure(selected_logging, root=identity.root)
     runtime = AddonRuntime(
         profile_id=identity.profile_id,
         root=identity.root,
@@ -478,6 +591,7 @@ def start_in_anki(
         port=selected_port,
         route_limits=route_limits,
         server_limits=server_limits,
+        logging_core=logging_core,
     )
     try:
         runtime.start()
@@ -498,12 +612,35 @@ def start_in_anki(
             main_window=main_window,
             runtime=runtime,
         )
+        _attach_preparation(aqt_module=aqt_module, main_window=main_window, runtime=runtime)
     except Exception:
         runtime.stop()
         raise
     # 变量保留给调试器/类型检查器，避免未来误把兼容性结果丢弃成隐式检查。
     del compatibility
     return runtime
+
+
+def _attach_preparation(*, aqt_module, main_window, runtime):
+    """Qt 只提供短定时器；所有源扫描、导出与打包都在后台执行。"""
+    if runtime.snapshot_jobs is None or not callable(getattr(getattr(main_window, "taskman", None), "run_on_main", None)):
+        return
+    factory = _query_op_factory(aqt_module)
+    host = AnkiQueryOpHost(factory, main_window,
+        schedule_on_main=getattr(getattr(main_window, "taskman", None), "run_on_main", None))
+    operations = QueryOpAdapter(host=host, context_provider=runtime.snapshot_context)
+    from aqt.qt import QObject, QTimer
+    if not isinstance(main_window, QObject):
+        return  # 无 Qt 对象的单元测试宿主不启动界面计时器。
+    from .anki.preparation import PreparedSync
+    preparation = PreparedSync(runtime, operations)
+    runtime._preparation = preparation
+    runtime.router.snapshot_files_service.require_prepared = True
+    timer = QTimer(main_window)
+    timer.setInterval(500)
+    timer.timeout.connect(preparation.tick)
+    preparation._timer = timer
+    timer.start()
 
 
 def register_in_anki(
@@ -517,14 +654,41 @@ def register_in_anki(
     port: int | None = None,
     route_limits: Any = None,
     server_limits: Any = None,
-    logger: Any = print,
+    logger: Any = None,
+    logging_core: AddonLogger | None = None,
 ) -> LifecycleController:
     """加载 add-on 时只注册 hook；profile 打开后才启动 runtime。"""
 
     if aqt_module is None:
         import aqt as aqt_module  # type: ignore[no-redef]
 
+    main_window = getattr(aqt_module, "mw", None)
+    if main_window is None:
+        raise RuntimeError("aqt.mw is unavailable")
+    module_name = addon_module_name or __name__
+    addon_id = _addon_id(main_window, module_name)
+    addon_root = _addon_root(main_window, addon_id)
     existing = getattr(aqt_module, _CONTROLLER_ATTR, None)
+    previous_core = (
+        existing.logging_core
+        if isinstance(existing, LifecycleController)
+        else None
+    )
+    logging_core = _initial_logging_core(
+        main_window=main_window,
+        addon_root=addon_root,
+        addon_id=addon_id,
+        user_files_root=user_files_root,
+        config=config,
+        existing=logging_core or previous_core,
+    )
+    callback_logger = logger if callable(logger) else None
+
+    def log_ui_failure(error: BaseException) -> None:
+        logging_core.log_exception("ui", "registration_failed", error, stage="registration")
+        if callback_logger is not None:
+            callback_logger(f"[InkCards] ui_registration_failed: {type(error).__name__}")
+
     if isinstance(existing, LifecycleController) and existing.registered and existing.enabled:
         try:
             from .ui.integration import register_tools_action, unregister_tools_action
@@ -534,23 +698,28 @@ def register_in_anki(
                 runtime_provider=lambda: existing.runtime,
                 config_writer=lambda enabled: write_device_server_host(
                     aqt_module=aqt_module,
-                    addon_module_name=addon_module_name or __name__,
+                    addon_module_name=module_name,
                     enabled=enabled,
+                ),
+                logging_policy_provider=lambda: logging_policy_from_config(
+                    _addon_config(main_window, addon_id, None)
+                ),
+                logging_policy_writer=lambda policy: write_logging_policy(
+                    aqt_module=aqt_module,
+                    addon_module_name=module_name,
+                    policy=policy,
+                    logger=logging_core,
+                    runtime_provider=lambda: existing.runtime,
                 ),
             )
             existing.set_ui_cleanup(lambda: unregister_tools_action(aqt_module))
         except Exception as exc:
-            logger(f"[InkCards] UI registration failed: {type(exc).__name__}: {exc}")
+            log_ui_failure(exc)
         return existing
     if gui_hooks_module is None:
         gui_hooks_module = getattr(aqt_module, "gui_hooks", None)
     if gui_hooks_module is None:
         from aqt import gui_hooks as gui_hooks_module  # type: ignore[no-redef]
-
-    main_window = getattr(aqt_module, "mw", None)
-    if main_window is None:
-        raise RuntimeError("aqt.mw is unavailable")
-    module_name = addon_module_name or __name__
 
     def addon_id_provider() -> str | None:
         return _addon_id(main_window, module_name)
@@ -566,12 +735,14 @@ def register_in_anki(
             port=port,
             route_limits=route_limits,
             server_limits=server_limits,
+            logging_core=logging_core,
         ),
         # 只用 profile folder 做生命周期切换比较；identity namespace 由
         # start_in_anki 内的 ProfileIdentityStore 再次计算，绝不使用显示名建目录。
         profile_provider=lambda: str(_profile_folder(main_window)),
         addon_id_provider=addon_id_provider,
-        logger=logger,
+        logger=callback_logger,
+        logging_core=logging_core,
     )
     controller.register()
     try:
@@ -585,12 +756,22 @@ def register_in_anki(
                 addon_module_name=module_name,
                 enabled=enabled,
             ),
+            logging_policy_provider=lambda: logging_policy_from_config(
+                _addon_config(main_window, addon_id, None)
+            ),
+            logging_policy_writer=lambda policy: write_logging_policy(
+                aqt_module=aqt_module,
+                addon_module_name=module_name,
+                policy=policy,
+                logger=logging_core,
+                runtime_provider=lambda: controller.runtime,
+            ),
         )
         controller.set_ui_cleanup(lambda: unregister_tools_action(aqt_module))
     except Exception as exc:
         # UI 缺失不能阻止 runtime/lifecycle hook 启动；真实宿主有 aqt.qt，
         # fake host 则在专门的 UI 测试中注入 fake Qt。
-        logger(f"[InkCards] UI registration failed: {type(exc).__name__}: {exc}")
+        log_ui_failure(exc)
     setattr(aqt_module, _CONTROLLER_ATTR, controller)
     return controller
 
@@ -599,7 +780,9 @@ __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_PORT",
     "register_in_anki",
+    "report_startup_failure",
     "resolve_server_config",
     "start_in_anki",
     "write_device_server_host",
+    "write_logging_policy",
 ]

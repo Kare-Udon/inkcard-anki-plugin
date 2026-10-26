@@ -39,7 +39,7 @@ from .models import (
 
 _MISSING = object()
 _MEDIA_TOKEN_RE = re.compile(
-    r"(?:\[sound:[^\]]+\]|\.(?:png|jpe?g|gif|webp|svg|bmp|mp3|wav|ogg|m4a|aac|flac|mp4|webm|mov)(?:[?#\s'\"]|$))",
+    r"(?:\[sound:[^\]]+\]|\[anki:play:[qa]:\d+\]|\.(?:png|jpe?g|gif|webp|svg|bmp|mp3|wav|ogg|m4a|aac|flac|mp4|webm|mov)(?:[?#\s'\"]|$))",
     re.IGNORECASE,
 )
 _QUEUE_NAMES = {
@@ -57,7 +57,8 @@ _QUEUE_NAMES = {
 }
 _TYPE_NAMES = {0: "new", 1: "learning", 2: "review", 3: "relearning"}
 _MEDIA_TAGS = {"img", "audio", "video", "source", "object", "embed"}
-DEFAULT_MAX_SCOPE_CARD_IDS = 4096
+DEFAULT_MAX_SCOPE_CARD_IDS = 32768
+DEFAULT_MAX_SOURCE_SCAN_CARD_IDS = 262144
 DEFAULT_EXPORT_BATCH_SIZE = 128
 DEFAULT_MAX_DECK_CATALOG_SIZE = 4096
 
@@ -737,6 +738,44 @@ class Anki260801Adapter:
                     )
         return sorted(selected, key=_id_sort_key)
 
+    def resolve_excluded_card_ids(
+        self, collection: Any, excluded_deck_ids: Sequence[str], *,
+        max_card_ids: int = DEFAULT_MAX_SCOPE_CARD_IDS,
+        cancel_check: Optional[Callable[[], None]] = None,
+    ) -> List[str]:
+        """全库搜索后核对实际 did；父组排除按当前名称动态覆盖子孙。"""
+        if isinstance(max_card_ids, bool) or not isinstance(max_card_ids, int) or max_card_ids <= 0:
+            raise ValueError("max_card_ids must be a positive integer")
+        pairs = self.read_deck_names_and_ids(collection, cancel_check=cancel_check)
+        names = dict(pairs)
+        excluded_names = [names[item] for item in excluded_deck_ids if item in names]
+        excluded = {deck_id for deck_id, name in pairs if deck_id in excluded_deck_ids or
+                    any(name == parent or name.startswith(parent + "::") for parent in excluded_names)}
+        finder = _value(collection, "find_cards", default=None)
+        if not callable(finder):
+            raise AnkiAdapterError("api_unavailable", "全库同步需要Collection.find_cards", status=503)
+        selected = set()
+        scanned = 0
+        matches = finder("", order=False)
+        if hasattr(matches, "__len__") and len(matches) > DEFAULT_MAX_SOURCE_SCAN_CARD_IDS:
+            raise AnkiAdapterError("source_scan_too_large", "源库超过262144张扫描预算；本次未发布", status=413, retryable=False)
+        for raw_id in matches:
+            if cancel_check is not None:
+                cancel_check()
+            scanned += 1
+            if scanned > DEFAULT_MAX_SOURCE_SCAN_CARD_IDS:
+                raise AnkiAdapterError("source_scan_too_large", "源库超过262144张扫描预算；本次未发布", status=413, retryable=False)
+            card_id = str(raw_id)
+            card = self._get_card(collection, card_id)
+            actual_deck = _safe_id(_first(card, "did", "deck_id"))
+            if actual_deck not in names:
+                raise AnkiAdapterError("deck_not_found", "卡片所属牌组不在目录中", status=409, retryable=False)
+            if actual_deck not in excluded:
+                selected.add(card_id)
+                if len(selected) > max_card_ids:
+                    raise AnkiAdapterError("scope_too_large", "参与同步卡片超过容量；请排除部分牌组", status=413, retryable=False)
+        return sorted(selected, key=_id_sort_key)
+
     def _card_ids(
         self,
         collection: Any,
@@ -1033,10 +1072,23 @@ class Anki260801Adapter:
         answer, answer_media = _clean_text(answer_raw)
         if question_raw is None or answer_raw is None:
             return None, (SkipReason.UNKNOWN_TEMPLATE.value,)
+        question_blocks = answer_blocks = None
+        media_assets = ()
         if question_media or answer_media:
-            if not question or not answer:
+            from .media_lab import extract_side
+            try:
+                question_blocks, question_assets, question_audio, question_content = extract_side(question_raw, collection)
+                answer_blocks, answer_assets, answer_audio, answer_content = extract_side(answer_raw, collection)
+            except (ValueError, OSError, AttributeError):
+                return None, (SkipReason.MEDIA_REFERENCE.value,)
+            if (question_audio and not question_content) or (answer_audio and not answer_content):
+                return None, (SkipReason.AUDIO_ONLY_SIDE.value,)
+            if not question_blocks or not answer_blocks:
                 return None, (SkipReason.MEDIA_ONLY.value,)
-            return None, (SkipReason.MEDIA_REFERENCE.value,)
+            media_assets = tuple(question_assets + answer_assets)
+            # 纯文本回退也使用替换后的正文，不泄漏播放标记或音频文件名。
+            question, answer = (" ".join("".join(b.get("text", "[图片]") for b in blocks).split())
+                                for blocks in (question_blocks, answer_blocks))
         if not question:
             return None, (SkipReason.EMPTY_QUESTION.value,)
         if not answer:
@@ -1075,6 +1127,9 @@ class Anki260801Adapter:
             due=due,
             question=question,
             answer=answer,
+            question_blocks=tuple(question_blocks) if question_blocks is not None else None,
+            answer_blocks=tuple(answer_blocks) if answer_blocks is not None else None,
+            media_assets=media_assets,
             interval_days=_integer(_first(card, "ivl", "interval_days")),
             factor=_integer(_first(card, "factor")),
             reps=_integer(_first(card, "reps")),
@@ -1093,6 +1148,7 @@ class Anki260801Adapter:
         *,
         card_ids: Optional[Sequence[str]] = None,
         deck_ids: Optional[Sequence[str]] = None,
+        excluded_deck_ids: Optional[Sequence[str]] = None,
         context: Any = None,
         max_card_ids: int = DEFAULT_MAX_SCOPE_CARD_IDS,
         batch_size: int = DEFAULT_EXPORT_BATCH_SIZE,
@@ -1143,7 +1199,11 @@ class Anki260801Adapter:
 
         if cancel_check is not None:
             cancel_check()
-        selected_ids = self._card_ids(
+        if excluded_deck_ids is not None and (card_ids is not None or deck_ids is not None):
+            raise AnkiAdapterError("scope_invalid", "排除策略与显式范围互斥", status=422)
+        selected_ids = self.resolve_excluded_card_ids(
+            collection, excluded_deck_ids, max_card_ids=max_card_ids, cancel_check=cancel_check,
+        ) if excluded_deck_ids is not None else self._card_ids(
             collection,
             card_ids,
             deck_ids,
@@ -1205,6 +1265,7 @@ class Anki260801Adapter:
                 anki_build=self.compatibility.build or SUPPORTED_ANKI_BUILD,
                 deck_ids=tuple(deck_ids_seen),
                 last_review_card_ids=last_review_card_ids,
+                review_log_card_ids=tuple(item.card_id for item in cards),
             )
             for item in cards:
                 source = captured_context.card_last_review_time_sources.get(item.card_id)
@@ -1221,7 +1282,8 @@ class Anki260801Adapter:
             runtime_epoch=before[2],
             anki_version=self.compatibility.version or SUPPORTED_ANKI_VERSION,
             anki_build=self.compatibility.build or SUPPORTED_ANKI_BUILD,
-            scope_card_ids=tuple(selected_ids),
+            # 排除策略由source_scope证明；卡ID已在分页/索引中，根清单不重复全库ID。
+            scope_card_ids=tuple(selected_ids) if excluded_deck_ids is None else (),
             scope_deck_ids=tuple(sorted(deck_ids_seen)),
             card_count=len(selected_ids),
             included_card_count=len(cards),
@@ -1241,6 +1303,7 @@ class Anki260801Adapter:
                 anki_build=self.compatibility.build or SUPPORTED_ANKI_BUILD,
                 deck_ids=tuple(deck_ids_seen),
                 last_review_card_ids=last_review_card_ids,
+                review_log_card_ids=tuple(item.card_id for item in cards),
             )
             if captured_context.source_sha256 != post_context.source_sha256:
                 raise AnkiAdapterError(

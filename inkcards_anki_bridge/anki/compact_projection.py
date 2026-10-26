@@ -11,7 +11,7 @@ import json
 import math
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional, Sequence
 
 
 PINNED_ANKI_VERSION = "26.09.3"
@@ -539,9 +539,10 @@ class CompactApplyAuthorization:
     source_id: str
     source_sha256: str
     evidence_sha256: str
+    baseline_proof_json: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "mode": self.mode,
             "policy_id": self.policy_id,
             "event_id": self.event_id,
@@ -557,6 +558,94 @@ class CompactApplyAuthorization:
             "source_sha256": self.source_sha256,
             "evidence_sha256": self.evidence_sha256,
         }
+        if self.baseline_proof_json is not None:
+            result["baseline_proof_json"] = self.baseline_proof_json
+        return result
+
+
+
+def resolve_counter_baseline(
+    context: Any,
+    identity: str,
+    generation: int,
+    edges: Sequence[Mapping[str, Any]],
+    *,
+    allow_gaps: bool = False,
+) -> tuple[dict[str, Any], Optional[str]]:
+    """仅从冻结帧和已验证收据重建计数；间隙证明不冒充评分收据。
+
+    调用方须先验证每条收据的终态及证据摘要。原生授权另验实际卡态、配置和计数，
+    Store 独立重算本函数并比对 intent.before。复杂度取决于收据数，不逐代扫描。
+    """
+    source = context.source
+    start = source.collection_generation
+    if identity != source.profile_identity or generation < start:
+        raise CompactProjectionError(
+            "snapshot_counter_generation_conflict", "快照基线身份或代数不符"
+        )
+    fields = (
+        "last_day_studied",
+        "new_studied",
+        "review_studied",
+        "learning_studied",
+        "milliseconds_studied",
+    )
+    counters = {
+        did: {name: node[name] for name in fields}
+        for did, node in source.deck_contexts.items()
+    }
+    cursor, gaps, receipts = start, [], []
+    for edge in sorted(edges, key=lambda row: row["generation"]):
+        before_generation = edge["generation"]
+        if (
+            before_generation < cursor
+            or before_generation >= generation
+            or edge["after_generation"] != before_generation + 1
+            or edge["identity"] != identity
+        ):
+            raise CompactProjectionError(
+                "snapshot_counter_receipt_path_invalid",
+                "评分收据代数重叠、分叉或身份不符",
+            )
+        if before_generation != cursor:
+            gaps.append([cursor, before_generation])
+        before, after = edge["before"], edge["after"]
+        if not before or not after or set(before) != set(after):
+            raise CompactProjectionError(
+                "snapshot_counter_receipt_path_invalid", "收据缺少完整计数范围"
+            )
+        if any(
+            did in counters and counters[did] != value for did, value in before.items()
+        ):
+            raise CompactProjectionError(
+                "snapshot_counter_baseline_conflict", "已验证收据计数与冻结基线不连续"
+            )
+        counters.update({did: value for did, value in after.items() if did in counters})
+        cursor = edge["after_generation"]
+        receipts.append(edge["receipt_hash"])
+    if cursor < generation:
+        gaps.append([cursor, generation])
+    if gaps and not allow_gaps:
+        raise CompactProjectionError(
+            "snapshot_counter_receipt_path_invalid", "冻结基线之后的代数链有缺口"
+        )
+    proof = None
+    if gaps:
+        proof = canonical_json(
+            {
+                "schema": "inkcards.baseline-compatibility.v1",
+                "snapshot_id": context.snapshot_id,
+                "snapshot_checksum": context.snapshot_checksum,
+                "source_sha256": context.source_sha256,
+                "collection_identity": identity,
+                "from_generation": start,
+                "to_generation": generation,
+                "gaps": gaps,
+                "receipts": receipts,
+                "counters_sha256": json_sha256(counters),
+            }
+        )
+    return counters, proof
 
 
 __all__ = [

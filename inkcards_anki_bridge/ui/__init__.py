@@ -10,8 +10,10 @@ from .presenter import (
     DeckItem,
     InkCardsPresenter,
     StatusView,
+    SyncOverview,
     ViewState,
     build_status_view,
+    build_sync_overview,
     is_valid_device_id,
     safe_error_message,
 )
@@ -22,8 +24,10 @@ __all__ = [
     "DeckItem",
     "InkCardsPresenter",
     "StatusView",
+    "SyncOverview",
     "ViewState",
     "build_status_view",
+    "build_sync_overview",
     "is_valid_device_id",
     "safe_error_message",
 ]

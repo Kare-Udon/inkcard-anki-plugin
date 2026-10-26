@@ -29,7 +29,7 @@ class PackageAnkiaddonTests(unittest.TestCase):
         return package_ankiaddon.write_package(root, output)
 
     def test_version_fields_and_archive_name_are_aligned(self) -> None:
-        expected_version = "0.2.0-preview.10"
+        expected_version = "0.2.0-preview.20"
         manifest = json.loads((SOURCE_ROOT / "manifest.json").read_text(encoding="utf-8"))
         from inkcards_anki_bridge import __version__
 
@@ -38,7 +38,7 @@ class PackageAnkiaddonTests(unittest.TestCase):
         self.assertEqual(package_ankiaddon.HUMAN_VERSION, expected_version)
         self.assertEqual(
             package_ankiaddon.ARCHIVE_FILENAME,
-            "InkCards-Anki-Bridge-0.2.0-preview.10.ankiaddon",
+            "InkCards-Anki-Bridge-0.2.0-preview.20.ankiaddon",
         )
 
     def test_real_build_contains_only_the_explicit_production_allowlist(self) -> None:
@@ -50,6 +50,8 @@ class PackageAnkiaddonTests(unittest.TestCase):
             names = self._build(root, output)
 
             self.assertEqual(names, [archive_name for _, archive_name in expected])
+            self.assertIn("inkcards_anki_bridge/logging_control.py", names)
+            self.assertIn("inkcards_anki_bridge/sync_policy.py", names)
             with zipfile.ZipFile(output) as archive:
                 infos = archive.infolist()
                 self.assertEqual(archive.namelist(), names)
@@ -100,6 +102,7 @@ class PackageAnkiaddonTests(unittest.TestCase):
         self.assertEqual(device_server["port"], package_ankiaddon.DEFAULT_PORT)
         self.assertEqual(device_server["host"], runtime_host)
         self.assertEqual(device_server["port"], runtime_port)
+        self.assertEqual(config["logging"], {"level": "warn", "console": False})
 
     def test_runtime_default_mismatch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="inkcards-package-test-") as name:
@@ -207,7 +210,7 @@ class BlockLegacyImports:
 sys.meta_path.insert(0, BlockLegacyImports())
 import inkcards_anki_bridge
 
-assert inkcards_anki_bridge.__version__ == "0.2.0-preview.10"
+assert inkcards_anki_bridge.__version__ == "0.2.0-preview.20"
 assert not any(
     name == "aqt" or name.startswith("aqt.")
     or name in {
@@ -231,7 +234,7 @@ print(inkcards_anki_bridge.__version__)
             capture_output=True,
             text=True,
         )
-        self.assertEqual(result.stdout.strip(), "0.2.0-preview.10")
+        self.assertEqual(result.stdout.strip(), "0.2.0-preview.20")
 
 
 if __name__ == "__main__":

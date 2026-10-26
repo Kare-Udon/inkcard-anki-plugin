@@ -20,7 +20,7 @@ from typing import Iterable, Mapping, Sequence, Tuple
 
 
 PACKAGE_ID = "inkcards_anki_bridge"
-HUMAN_VERSION = "0.2.0-preview.10"
+HUMAN_VERSION = "0.2.0-preview.20"
 VERSION = HUMAN_VERSION
 ARCHIVE_FILENAME = f"InkCards-Anki-Bridge-{HUMAN_VERSION}.ankiaddon"
 MIN_POINT_VERSION = 260801
@@ -38,10 +38,10 @@ ROOT_FILES = frozenset(
         "config.md",
     }
 )
-ROOT_DIRECTORIES = frozenset({"inkcards_anki_bridge", "user_files"})
+ROOT_DIRECTORIES = frozenset({"inkcards_anki_bridge", "user_files", "vendor"})
 # 这些目录是源码树中的开发资产，明确不属于安装包；它们不参与候选文件发现。
 IGNORED_ROOT_DIRECTORIES = frozenset(
-    {".git", "__pycache__", "dist", "research", "tests", "tools"}
+    {".git", "__pycache__", ".pytest_cache", "dist", "research", "tests", "tools"}
 )
 IGNORED_ROOT_FILES = frozenset({"README.md", "README.en.md", ".gitignore", ".gitattributes"})
 BRIDGE_TOP_FILES = frozenset(
@@ -49,9 +49,11 @@ BRIDGE_TOP_FILES = frozenset(
         "__init__.py",
         "adapter.py",
         "lifecycle.py",
+        "logging_control.py",
         "plugin.py",
         "profile_identity.py",
         "runtime.py",
+        "sync_policy.py",
     }
 )
 # 旧模块仍可作为历史源码留在工作区，但不能进入新的单一 Anki 插件产物。
@@ -179,6 +181,9 @@ def _validate_config(root: Path) -> None:
         _fail(f"config.json device_server.host must match runtime default {runtime_host!r}")
     if device_server.get("port") != runtime_port:
         _fail(f"config.json device_server.port must match runtime default {runtime_port!r}")
+    logging = config.get("logging")
+    if not isinstance(logging, dict) or logging != {"level": "warn", "console": False}:
+        _fail("config.json logging must default to warn with console disabled")
 
 
 def _validate_root_layout(root: Path) -> None:
@@ -197,6 +202,42 @@ def _validate_root_layout(root: Path) -> None:
             _fail(f"unknown package-root path: {_relative_name(root, entry)}")
     _validate_manifest(root)
     _validate_config(root)
+
+
+def _collect_vendor_files(root: Path, entries: list[Entry]) -> None:
+    """原生图像依赖按逐文件摘要白名单收录，未知路径与字节均拒绝。"""
+    vendor = root / "vendor"
+    manifest = _validate_json_file(vendor / "manifest.json", "vendor/manifest.json")
+    if (manifest.get("name"), manifest.get("version"), manifest.get("platform")) != (
+        "Pillow", "12.3.0", "cp313-cp313-macosx_11_0_arm64"
+    ):
+        _fail("unexpected image dependency")
+    expected = manifest.get("files")
+    if not isinstance(expected, dict) or not expected:
+        _fail("image dependency file manifest missing")
+    actual = set()
+    for current, directories, files in os.walk(vendor, followlinks=False):
+        current_path = Path(current)
+        for directory in directories:
+            if (current_path / directory).is_symlink():
+                _fail("symbolic links are forbidden in image dependency")
+        directories[:] = [d for d in directories if d != "__pycache__"]
+        for filename in files:
+            path = current_path / filename
+            relative = path.relative_to(vendor).as_posix()
+            if relative == "manifest.json":
+                continue
+            _require_regular_file(path, relative)
+            validate_archive_name(relative)
+            if not relative.startswith(("PIL/", "licenses/")):
+                _fail("unknown image dependency path: " + relative)
+            if relative not in expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected[relative]:
+                _fail("image dependency checksum mismatch: " + relative)
+            actual.add(relative)
+            entries.append((path, "vendor/" + relative))
+    if actual != set(expected):
+        _fail("image dependency files missing")
+    entries.append((vendor / "manifest.json", "vendor/manifest.json"))
 
 
 def _collect_python_tree(root: Path, start: Path, entries: list[Entry]) -> None:
@@ -308,6 +349,7 @@ def package_files(root: Path | None = None) -> list[Entry]:
         path = selected_root / name
         _require_regular_file(path, name)
         entries.append((path, name))
+    _collect_vendor_files(selected_root, entries)
     _collect_user_files(selected_root, entries)
     _collect_bridge_files(selected_root, entries)
     validated = validate_entries(entries)

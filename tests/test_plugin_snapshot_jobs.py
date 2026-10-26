@@ -57,7 +57,7 @@ class FakeQueryOp:
 
 
 class FakeServer:
-    def __init__(self, _router, *, host, port, limits=None) -> None:
+    def __init__(self, _router, *, host, port, limits=None, request_log=None) -> None:
         self.server_address = (host, 39123 if port == 0 else port)
         self.started = False
 

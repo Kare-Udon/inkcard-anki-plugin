@@ -100,6 +100,7 @@ class CapturedApplicationContext:
     clock_config: Mapping[str, Any] = field(default_factory=dict)
     source_summary: Mapping[str, str] = field(default_factory=dict)
     card_last_review_time_sources: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    card_review_log_hashes: Mapping[str, str] = field(default_factory=dict)
     unsupported: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -239,6 +240,10 @@ class CapturedApplicationContext:
             if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
                 raise ValueError("invalid last review source digest")
         object.__setattr__(self, "card_last_review_time_sources", _freeze(self.card_last_review_time_sources))
+        for card_id, digest in self.card_review_log_hashes.items():
+            if not str(card_id).isdigit() or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("invalid card review history digest")
+        object.__setattr__(self, "card_review_log_hashes", _freeze(self.card_review_log_hashes))
         object.__setattr__(self, "unsupported", tuple(sorted(set(self.unsupported))))
         # Reject non-JSON values at capture time instead of failing later during save.
         canonical_json(self.to_dict())
@@ -270,6 +275,8 @@ class CapturedApplicationContext:
         # 旧 context 的 canonical bytes/hash 不变。
         if self.card_last_review_time_sources:
             result["card_last_review_time_sources"] = _plain(self.card_last_review_time_sources)
+        if self.card_review_log_hashes:
+            result["card_review_log_hashes"] = _plain(self.card_review_log_hashes)
         return result
 
     @property
@@ -312,6 +319,7 @@ class CapturedApplicationContext:
             clock_config=value.get("clock_config", {}),
             source_summary=value.get("source_summary", {}),
             card_last_review_time_sources=value.get("card_last_review_time_sources", {}),
+            card_review_log_hashes=value.get("card_review_log_hashes", {}),
             unsupported=tuple(unsupported),
         )
 
@@ -655,6 +663,7 @@ def capture_collection_context(
     anki_build: str,
     deck_ids: Sequence[str],
     last_review_card_ids: Sequence[str] = (),
+    review_log_card_ids: Sequence[str] = (),
 ) -> CapturedApplicationContext:
     """通过当前 QueryOp Collection 读取评分输入，不使用 exporter 的默认值。"""
 
@@ -774,6 +783,11 @@ def capture_collection_context(
             str(cid): capture_last_review_time_source(collection, collection.get_card(int(cid)))
             for cid in last_review_card_ids
         },
+        card_review_log_hashes={
+            str(cid): _sha256(canonical_json([list(row) for row in collection.db.all(
+                "SELECT id,cid,usn,ease,ivl,lastIvl,factor,time,type FROM revlog WHERE cid=? ORDER BY id", int(cid)
+            )])) for cid in review_log_card_ids
+        } if callable(getattr(getattr(collection, "db", None), "all", None)) else {},
         unsupported=tuple(unsupported),
     )
 

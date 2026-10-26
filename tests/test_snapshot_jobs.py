@@ -200,6 +200,24 @@ class SnapshotJobsTests(unittest.TestCase):
         self.assertEqual(job.state, SnapshotJobState.PUBLISHED)
         self.assertIsNotNone(job.result)
 
+    def test_http_poll_does_not_wait_for_atomic_publication(self):
+        entered, release = threading.Event(), threading.Event()
+        def publish(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return {'published': True}
+        self.manager._publish = publish
+        job = self.manager.request_snapshot(card_ids=['1'])
+        worker = threading.Thread(target=self.run_pending)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertIsNone(job.poll_state(), '提交锁繁忙时立即返回待准备')
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertEqual(job.poll_state(), SnapshotJobState.PUBLISHED)
+
     def test_failed_publication_does_not_retain_snapshot_through_exception_chain(self):
         payloads = []
 

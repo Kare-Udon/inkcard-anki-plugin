@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -21,7 +21,7 @@ from .adapter_260801 import (
 from .operations import OperationContext, OperationResult, OperationState, QueryOpAdapter
 
 
-DEFAULT_MAX_DECK_IDS = 64
+DEFAULT_MAX_DECK_IDS = 4096
 DEFAULT_SNAPSHOT_CARD_LIMIT = DEFAULT_MAX_SCOPE_CARD_IDS
 
 
@@ -96,6 +96,7 @@ class DeckCatalogEntry:
     path: Tuple[str, ...]
     depth: int
     unsupported: Tuple[str, ...] = ()
+    card_count: Optional[int] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "deck_id", str(self.deck_id))
@@ -125,6 +126,7 @@ class DeckCatalogEntry:
             "depth": self.depth,
             "level": self.level,
             "unsupported": list(self.unsupported),
+            "card_count": self.card_count,
         }
 
 
@@ -271,7 +273,17 @@ def build_deck_catalog(
         )
     except AnkiAdapterError as exc:
         raise _translate_adapter_error(exc) from exc
-    return _build_entries(pairs)
+    catalog = _build_entries(pairs)
+    entries = []
+    for entry in catalog.entries:
+        if cancel_check is not None:
+            cancel_check()
+        try:
+            count = adapter.count_deck_cards(collection, [entry.deck_id])
+        except AnkiAdapterError:
+            count = None
+        entries.append(replace(entry, card_count=count))
+    return DeckCatalog(tuple(entries))
 
 
 def build_deck_preflight(

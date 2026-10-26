@@ -13,8 +13,8 @@ import anki.collection  # noqa: F401
 from inkcards_anki_bridge.anki.compact_projection import canonical_json, json_sha256
 from inkcards_anki_bridge.runtime import AddonRuntime
 from inkcards_anki_bridge.services.compact_application import CompactApplicationError
-from inkcards_anki_bridge.ui.dialog import InkCardsDialog
 from inkcards_anki_bridge.ui.presenter import InkCardsPresenter
+from inkcards_anki_bridge.ui.settings_dialog import SettingsDialog
 from test_adopted_restore import adopted_fixture
 from test_compact_service import DEVICE, SESSION, SyntheticFixture
 
@@ -85,13 +85,13 @@ class ApprovedRecoveryUiTests(unittest.TestCase):
             status=lambda: {"state": "running", "running": True},
         )
         presenter = InkCardsPresenter(lambda: runtime)
-        dialog = object.__new__(InkCardsDialog)
+        dialog = object.__new__(SettingsDialog)
         dialog._presenter = presenter
         dialog._render = Mock()
         presenter.view()
         presenter.poll()
         runtime.request_approved_adopted_recovery.assert_not_called()
-        InkCardsDialog._request_approved_recovery(dialog)
+        SettingsDialog._request_approved_recovery(dialog)
         runtime.request_approved_adopted_recovery.assert_called_once_with()
         self.assertFalse(presenter.view().buttons.recovery)
         job.state = "applied"
@@ -100,6 +100,6 @@ class ApprovedRecoveryUiTests(unittest.TestCase):
         runtime.request_approved_adopted_recovery.side_effect = CompactApplicationError(
             "adopted_source_missing", "secret-not-for-display"
         )
-        InkCardsDialog._request_approved_recovery(dialog)
+        SettingsDialog._request_approved_recovery(dialog)
         self.assertIn("尚未导入", presenter.view().error_message)
         self.assertNotIn("secret", presenter.view().error_message)

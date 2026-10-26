@@ -492,7 +492,9 @@ class CompactServiceTests(unittest.TestCase):
                     fixture.close()
 
     def test_v2_receipt_overlay_conflicts_reject_new_card_before_intent(self) -> None:
-        for tamper in ("parent_counter", "child_counter", "generation_gap", "receipt_hash"):
+        # 版本间隙现在由 test_generation_compatibility 验证：有效证明允许，
+        # 缺失/伪造证明拒绝；原 Store 无证明跳代断言仍保留。
+        for tamper in ("parent_counter", "child_counter", "receipt_hash"):
             with self.subTest(tamper=tamper):
                 fixture = SyntheticFixture(self.root / ("overlay-" + tamper))
                 try:
@@ -507,8 +509,6 @@ class CompactServiceTests(unittest.TestCase):
                         deck = fixture.collection._backend.get_deck(did)
                         deck.common.review_studied += 17
                         fixture.collection._backend.update_deck(deck)
-                    elif tamper == "generation_gap":
-                        fixture.store.set_collection_generation(2)
                     else:
                         # 仅篡改测试所有 SQLite 行，不触及真实用户卡库或生产 schema。
                         db = fixture.store.connect()

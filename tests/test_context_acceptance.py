@@ -1149,37 +1149,138 @@ class ContextAcceptanceTests(unittest.TestCase):
             _verify_snapshot_card(self.collection, self.collection.get_card(card_id), wire_card, stored.application_context)
 
     def test_fallback_time_native_export_device_projection_commit(self):
+        import http.client
         import subprocess
+        from urllib.parse import urlsplit
+
+        from inkcards_anki_bridge.device.auth import DeviceAuthenticator
+        from inkcards_anki_bridge.device.routes import DeviceRouter
+        from inkcards_anki_bridge.device.server import DeviceServer
+        from inkcards_anki_bridge.services.inbox import InboxService
+        from inkcards_anki_bridge.services.snapshot_files import SnapshotFilesService
+
         card_id, stored, _ = self._fallback_time_fixture(enqueue=False)
         wire = json.loads(stored.payload_json)
-        context = dict(device_id="qa-context-device", session_id="fallback-session",
-                       scope_id=stored.scope_id, local_generation=1)
-        opened = self.snapshot_service.open_pull(**context)
-        credentials = dict(permit_id=opened["permit_id"], nonce=opened["nonce"])
-        page = self.snapshot_service.page(**context, **credentials, page_index=0, cursor=None)
-        self.assertTrue(page["complete"])
-        committed = self.snapshot_service.commit(**context, **credentials)
-        status = {"device_id": "qa-context-device", "profile_id": self.profile_id,
-                  "session_id": "fallback-session", "phase": "idle", "ready_scope_id": stored.scope_id,
-                  "compact_delivery": {"total": 0, "counts": {"received": 0}, "ack_semantics": "received_not_applied"},
-                  "compact_application": {"total": 0, "recovery_required": 0,
-                    "counts": dict(not_applied=0, applying=0, applied=0, unknown=0, conflict=0),
-                    "applied_watermark": "unknown"}}
-        handshake = {"device_id": "qa-context-device", "profile_id": self.profile_id,
-                     "protocol": "x4-2", "session_id": "fallback-session",
-                     "session": {"id": "fallback-session", "high_water": 0, "next_sequence": 1}}
-        fixture = {"epoch_sec": int(time.time()), "scope_id": stored.scope_id,
-                   "last_review_time_ms": wire["cards"][0]["last_review_time_ms"],
-                   "responses": [{"path": path, "body": body} for path, body in (
-                       ("v2/handshake", handshake), ("v2/sync/status", status),
-                       ("v2/pull/open", opened), ("v2/pull/page", page), ("v2/pull/commit", committed))]}
-        path = self.root / "fallback-device-fixture.json"
-        path.write_text(json.dumps(fixture, ensure_ascii=False))
-        for engine in ("/opt/homebrew/bin/lua",
-                       "diagnostics/full_scheduler_lab_20261002/device/runs/20261002T213440Z-fsrs32-medium1-9401/runtime/lua"):
-            result = subprocess.run([engine, "tests/x4_last_review_time_fallback.lua", str(path)],
-                                    capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        last_review_time_ms = wire["cards"][0]["last_review_time_ms"]
+        self.assertIsInstance(last_review_time_ms, int)
+
+        def refresh(**kwargs):
+            if kwargs["scope_id"] != stored.scope_id:
+                return 409, {"error": {"code": "scope_mismatch"}}
+            return 200, {
+                "protocol": "x4-2",
+                "profile_id": self.profile_id,
+                "scope_id": stored.scope_id,
+                "snapshot_id": stored.snapshot_id,
+                "snapshot_generation": stored.snapshot_generation,
+                "mode": "full",
+            }
+
+        files = SnapshotFilesService(self.with_context)
+        router = DeviceRouter(
+            DeviceAuthenticator(self.with_context),
+            InboxService(self.with_context),
+            snapshot_service=self.snapshot_service,
+            snapshot_files_service=files,
+            refresh_handler=refresh,
+        )
+        server = DeviceServer(router)
+        xtapp_root = Path(__file__).resolve().parents[2]
+        workspace_root = Path(__file__).resolve().parents[4]
+        engines = (
+            Path("/opt/homebrew/bin/lua"),
+            workspace_root
+            / "diagnostics/full_scheduler_lab_20261002/device/runs/20261002T213440Z-fsrs32-medium1-9401/runtime/lua",
+        )
+        try:
+            server.start()
+            for index, engine in enumerate(engines, start=1):
+                self.assertTrue(engine.is_file(), f"Lua engine is missing: {engine}")
+                device_id = f"qa-context-device-{index}"
+                session_id = f"fallback-session-{index}"
+                token = f"qa-context-token-{index}"
+                self.with_context.register_device(device_id, token)
+                self.with_context.open_session(device_id, session_id)
+
+                with subprocess.Popen(
+                    [str(engine), "tests/x4_last_review_time_fallback.lua"],
+                    cwd=xtapp_root,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ) as process:
+                    assert process.stdin and process.stdout and process.stderr
+
+                    def send(value):
+                        process.stdin.write(
+                            json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                            + "\n"
+                        )
+                        process.stdin.flush()
+
+                    send({
+                        "address": f"http://{server.host}:{server.port}",
+                        "device_id": device_id,
+                        "session_id": session_id,
+                        "profile_id": self.profile_id,
+                        "scope_id": stored.scope_id,
+                        "snapshot_id": stored.snapshot_id,
+                        "token": token,
+                        "epoch_sec": int(time.time()),
+                        "last_review_time_ms": last_review_time_ms,
+                    })
+                    paths = []
+                    result_message = None
+                    while line := process.stdout.readline():
+                        message = json.loads(line)
+                        if message["kind"] == "request":
+                            spec = message["spec"]
+                            parsed = urlsplit(spec["url"])
+                            connection = http.client.HTTPConnection(
+                                parsed.hostname, parsed.port, timeout=5
+                            )
+                            connection.request(
+                                "POST",
+                                parsed.path,
+                                body=spec["body"].encode("utf-8"),
+                                headers=spec["headers"],
+                            )
+                            response = connection.getresponse()
+                            raw = response.read()
+                            status = response.status
+                            response_headers = dict(response.getheaders())
+                            paths.append(parsed.path)
+                            connection.close()
+                            send({
+                                "status": status,
+                                "body": raw.decode("utf-8"),
+                                "headers": response_headers,
+                            })
+                        elif message["kind"] == "done":
+                            result_message = message
+                            send({"ok": True})
+                            break
+                        else:
+                            self.fail(f"unexpected Lua bridge message: {message!r}")
+
+                    process.stdin.close()
+                    returncode = process.wait(timeout=30)
+                    stderr = process.stderr.read()
+                    self.assertEqual(returncode, 0, stderr)
+                    self.assertIsNotNone(result_message, stderr)
+                    self.assertEqual(
+                        str(result_message["last_answered_at_ms"]),
+                        str(last_review_time_ms),
+                    )
+                    self.assertIn("/v2/pull/refresh", paths)
+                    self.assertIn("/v2/artifacts/open", paths)
+                    self.assertGreater(paths.count("/v2/artifacts/manifest"), 0)
+                    self.assertGreater(paths.count("/v2/artifacts/file"), 0)
+                    self.assertEqual(paths.count("/v2/artifacts/commit"), 1)
+        finally:
+            server.stop()
+
         self.assertIsNone(self.collection.get_card(card_id).last_review_time)
 
     def test_fallback_time_history_drift_after_authorization_is_no_write(self):

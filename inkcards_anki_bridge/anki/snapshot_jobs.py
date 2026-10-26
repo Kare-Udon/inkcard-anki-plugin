@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
+from ..adapter import AnkiAdapterError
 from .adapter_260801 import (
     DEFAULT_EXPORT_BATCH_SIZE,
     DEFAULT_MAX_SCOPE_CARD_IDS,
@@ -27,7 +28,7 @@ from .operations import (
 )
 
 
-DEFAULT_MAX_DECK_IDS = 64
+DEFAULT_MAX_DECK_IDS = 4096
 
 
 class SnapshotJobError(Exception):
@@ -106,7 +107,7 @@ class SnapshotScope:
     ids: Tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if self.kind not in {"card", "deck"} or not self.ids:
+        if self.kind not in {"card", "deck", "exclude"} or (not self.ids and self.kind != "exclude"):
             raise ValueError("invalid snapshot scope")
         object.__setattr__(self, "ids", tuple(self.ids))
 
@@ -129,11 +130,20 @@ def make_scope(
     *,
     card_ids: Optional[Sequence[Any]],
     deck_ids: Optional[Sequence[Any]],
+    excluded_deck_ids: Optional[Sequence[str]] = None,
     max_card_ids: int = DEFAULT_MAX_SCOPE_CARD_IDS,
     max_deck_ids: int = DEFAULT_MAX_DECK_IDS,
 ) -> SnapshotScope:
     """规范化窄 scope API；两个字段同时出现或均为空都拒绝。"""
 
+    if excluded_deck_ids is not None:
+        if card_ids is not None or deck_ids is not None:
+            raise SnapshotJobError("scope_invalid", "排除策略不能与显式范围混用", status=422)
+        from ..sync_policy import normalize_excluded_ids, SyncPolicyError
+        try:
+            return SnapshotScope("exclude", tuple(normalize_excluded_ids(excluded_deck_ids)))
+        except SyncPolicyError as error:
+            raise SnapshotJobError(error.code, error.message, status=422) from None
     if card_ids is not None and deck_ids is not None:
         raise SnapshotJobError("scope_invalid", "card_ids and deck_ids are mutually exclusive", status=422)
     if card_ids is not None:
@@ -188,6 +198,15 @@ class SnapshotJob:
     def state(self) -> SnapshotJobState:
         with self._manager._lock:
             return self._state
+
+    def poll_state(self) -> Optional[SnapshotJobState]:
+        """HTTP 进度轮询不等待耗时的原子发布；锁繁忙即仍在准备。"""
+        if not self._manager._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._state
+        finally:
+            self._manager._lock.release()
 
     @property
     def scope_id(self) -> str:
@@ -323,7 +342,7 @@ class SnapshotJobManager:
         # 异常的 traceback/链会反向持有完整导出，仅归档稳定摘要。
         job._error = SnapshotJobError(
             str(getattr(error, "code", "snapshot_job_failed")),
-            error.message if isinstance(error, SnapshotJobError) else "快照作业失败",
+            error.message if isinstance(error, (SnapshotJobError, AnkiAdapterError)) else "快照作业失败",
             status=getattr(error, "status", 409),
         ) if error is not None else None
         # 仅保留发布结果用于轮询，原始完整导出只应活到发布完成。
@@ -345,6 +364,7 @@ class SnapshotJobManager:
         card_ids: Optional[Sequence[Any]] = None,
         deck_ids: Optional[Sequence[Any]] = None,
         applied_watermark: Optional[int] = None,
+        excluded_deck_ids: Optional[Sequence[str]] = None,
     ) -> SnapshotJob:
         if applied_watermark is not None and (
             isinstance(applied_watermark, bool) or not isinstance(applied_watermark, int)
@@ -354,6 +374,7 @@ class SnapshotJobManager:
         scope = make_scope(
             card_ids=card_ids,
             deck_ids=deck_ids,
+            excluded_deck_ids=excluded_deck_ids,
             max_card_ids=self._max_card_ids,
             max_deck_ids=self._max_deck_ids,
         )
@@ -378,15 +399,42 @@ class SnapshotJobManager:
                 if job._state == SnapshotJobState.QUEUED:
                     job._state = SnapshotJobState.STARTED
             self._ensure_active(job)
-            return self._exporter.export_snapshot_from_collection(
+            snapshot = self._exporter.export_snapshot_from_collection(
                 collection,
                 card_ids=scope.ids if scope.kind == "card" else None,
                 deck_ids=scope.ids if scope.kind == "deck" else None,
+                **({"excluded_deck_ids": scope.ids} if scope.kind == "exclude" else {}),
                 context=job.context,
                 max_card_ids=self._max_card_ids,
                 batch_size=self._export_batch_size,
                 cancel_check=lambda: self._ensure_active(job),
             )
+
+            # 音频专用卡属于设备能力过滤；其他导出错误仍阻断提交。
+            blocking_skips = tuple(item for item in snapshot.manifest.skipped
+                                   if item.reason.value != "audio_only_side")
+            if scope.kind == "exclude" and (blocking_skips or snapshot.manifest.unsupported):
+                reasons = sorted(set(snapshot.manifest.unsupported) | {
+                    str(item.reason.value) for item in blocking_skips})
+                affected = sorted({str(item.card_id) for item in blocking_skips} |
+                                  {item.card_id for item in snapshot.cards if item.unsupported})
+                affected_deck_ids = set()
+                for card_id in affected:
+                    native_card = self._exporter._get_card(collection, card_id)
+                    affected_deck_ids.add(str(getattr(native_card, "did", "")))
+                unsupported_presets = {item.preset_id for item in snapshot.presets if item.unsupported}
+                affected_decks = [item for item in snapshot.decks if item.deck_id in affected_deck_ids
+                                  or item.unsupported or item.preset_id in unsupported_presets]
+                if not affected_decks and snapshot.manifest.unsupported:
+                    affected_decks = list(snapshot.decks)
+                deck_summary = ", ".join(str(item.name)[:80] + "(" + item.deck_id + ")"
+                                         for item in affected_decks[:10])
+                raise SnapshotJobError("snapshot_content_unsupported",
+                    "自动同步被不支持内容阻断：" + ", ".join(reasons) +
+                    "; 受影响牌组=" + deck_summary +
+                    "; 受影响卡片=" + ",".join(affected[:20]) +
+                    "; 受影响卡片数量=" + str(len(affected)), status=409)
+            return snapshot
 
         try:
             task = self._operation_adapter.submit(

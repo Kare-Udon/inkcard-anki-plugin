@@ -13,6 +13,20 @@ from inkcards_anki_bridge.storage import CommitUnknownError, ProfileStore
 
 
 class CompactRouteTests(unittest.TestCase):
+    def test_blocked_job_is_a_terminal_sync_phase_with_its_reason(self):
+        self.call("/v3/reviews/compact", self.batch(1, [[1, 3, 1000, 20]]))
+        for state in ("blocked", "conflict", "failed", "unknown", "canceled", "stale_result_dropped"):
+            with self.subTest(state=state):
+                self.router.compact_job_status_reader = lambda *_: {
+                    "state": state, "reason": "snapshot_counter_receipt_path_invalid",
+                }
+                status, body = self.call("/v2/sync/status", {
+                    "device_id": "device-a", "session_id": "session-a",
+                })
+                self.assertEqual(status, 200)
+                self.assertIn(body["phase"], ("blocked", "reconcile_application"))
+                self.assertEqual(body["last_error"], "snapshot_counter_receipt_path_invalid")
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
@@ -20,8 +34,8 @@ class CompactRouteTests(unittest.TestCase):
         self.auth = DeviceAuthenticator(self.store, clock=lambda: 1_000_000)
         self.router = DeviceRouter(self.auth, InboxService(self.store))
         code = self.auth.issue_pairing_code()
-        _, pair = self.call("/v2/pair", {"code": code, "device_id": "device-a"})
-        self.headers = {"Authorization": "Bearer " + pair["token"]}
+        credential = self.auth.pair(code, "device-a")
+        self.headers = {"Authorization": "Bearer " + credential.token}
         self.call("/v2/handshake", {
             "protocol": "x4-2", "device_id": "device-a", "session_id": "session-a"
         })

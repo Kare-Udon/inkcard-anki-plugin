@@ -7,6 +7,7 @@ import tempfile
 import threading
 import types
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -301,13 +302,25 @@ class PluginRuntimeTests(unittest.TestCase):
             pairing = first.issue_pairing_code()
             connection = http.client.HTTPConnection("127.0.0.1", first_port, timeout=1)
             try:
+                token = uuid.uuid4().hex + uuid.uuid4().hex
+                pairing_id = str(uuid.uuid4())
                 raw = json.dumps(
-                    {"code": pairing, "device_id": "device-a"},
+                    {"code": pairing, "device_id": "device-a", "pairing_id": pairing_id, "token": token},
                     separators=(",", ":"),
                 ).encode("utf-8")
                 connection.request("POST", "/v2/pair", raw)
                 response = connection.getresponse()
-                token = json.loads(response.read().decode("utf-8"))["token"]
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode("utf-8"))["status"], "pending")
+            finally:
+                connection.close()
+            connection = http.client.HTTPConnection("127.0.0.1", first_port, timeout=1)
+            try:
+                raw = json.dumps({"device_id": "device-a", "pairing_id": pairing_id}).encode()
+                connection.request("POST", "/v2/pair/confirm", raw, {"Authorization": "Bearer " + token})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode())["status"], "active")
             finally:
                 connection.close()
 

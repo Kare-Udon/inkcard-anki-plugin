@@ -36,6 +36,7 @@ from ..anki.compact_projection import (
     canonical_json,
     json_sha256,
     object_from_json,
+    resolve_counter_baseline,
 )
 from ..storage.errors import StorageValidationError
 
@@ -153,6 +154,7 @@ class CompactApplicationService:
             raise CompactApplicationError("legacy_source_required", "恢复授权只能来自电脑端核验并导入的来源")
         legacy_source = restored_source
         predecessor = self._predecessor_after(event_map, device_id, session_id)
+        counters, proof = self._counter_baseline_resolution(snapshot, collection_identity, generation, allow_gaps=True)
         try:
             return create_apply_authorization(
                 collection,
@@ -163,7 +165,8 @@ class CompactApplicationService:
                 mode=("adopted_restore" if snapshot.adopted_source is not None else "legacy_restore") if legacy_source is not None else "device_policy",
                 legacy_source=legacy_source,
                 predecessor_after=predecessor,
-                expected_counters=self._snapshot_counter_baseline(snapshot, collection_identity, generation),
+                expected_counters=counters,
+                baseline_proof_json=proof,
             )
         except CompactNativeError as exc:
             raise CompactApplicationError(exc.code, exc.message) from exc
@@ -198,6 +201,9 @@ class CompactApplicationService:
                 if source is None or source["source_sha256"] != authorization.source_sha256:
                     raise CompactApplicationError("legacy_source_changed", "授权后恢复来源已改变")
             predecessor = self._predecessor_after(event_map, device_id, session_id)
+            counters, proof = self._counter_baseline_resolution(snapshot, collection_identity, generation, allow_gaps=True)
+            if proof != authorization.baseline_proof_json:
+                raise CompactApplicationError("authorization_stale", "兼容性依据在授权后已变化")
             prepared = self.adapter.prepare_event(
                 collection,
                 event_map,
@@ -208,7 +214,7 @@ class CompactApplicationService:
                 intent_id=intent_id,
                 attempt_id=attempt_id,
                 predecessor_after=predecessor,
-                expected_counters=self._snapshot_counter_baseline(snapshot, collection_identity, generation),
+                expected_counters=counters,
             )
         except (CompactNativeError, CompactProjectionError, CompactApplicationError) as exc:
             if self.diagnostics is not None:
@@ -738,69 +744,84 @@ class CompactApplicationService:
         native_card_hex = raw_final.get("native_card_hex")
         if not isinstance(native_card_hex, str) or not native_card_hex:
             raise CompactApplicationError("compact_predecessor_native_receipt_missing", "前序读回未绑定原始卡片位型")
-        return {**after, "native_card_hex": native_card_hex}
+        return {**after, "native_card_hex": native_card_hex,
+                "native_revlogs_sha256": json_sha256(raw_final["native_revlogs"]) if isinstance(raw_final.get("native_revlogs"), list) else None}
 
     def _snapshot_counter_baseline(
-        self, snapshot: Any, collection_identity: str, generation: int,
+        self, snapshot: Any, collection_identity: str, generation: int
     ) -> Optional[dict[str, Any]]:
-        """从 snapshot g0 冻结帧沿唯一有效原生收据推进，绝不用 live 值补历史基线。"""
+        # 既有严格接口继续拒绝未证明的版本间隙。
+        return self._counter_baseline_resolution(
+            snapshot, collection_identity, generation
+        )[0]
 
-        # adopted 的批准语义是保留每次写入时的当前计数，而非冻结捕获计数。
-        # 启动/外部 operation 可推进 generation，没有评分收据也不伪造代数边。
-        if getattr(snapshot, "adopted_source", None) is not None:
-            return None
-        context = getattr(snapshot, "application_context", None)
-        if context is None:
-            return None
-        source = context.source
-        cursor = source.collection_generation
-        if generation < cursor or source.profile_identity != collection_identity:
-            raise CompactApplicationError("snapshot_counter_generation_conflict", "快照基线身份或代数不符")
-        counters = {
-            did: {name: node[name] for name in DECK_COUNTER_FIELDS}
-            for did, node in source.deck_contexts.items()
-        }
-        if generation == cursor:
-            return counters
+    def _counter_baseline_resolution(
+        self,
+        snapshot: Any,
+        collection_identity: str,
+        generation: int,
+        *,
+        allow_gaps: bool = False,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        if (
+            getattr(snapshot, "adopted_source", None) is not None
+            or snapshot.application_context is None
+        ):
+            return None, None
+        context = snapshot.application_context
         db = self.store.connect()
         try:
             db.execute("PRAGMA query_only=ON")
             scopes = db.execute(
                 "SELECT DISTINCT device_id,session_id FROM compact_applications WHERE profile_id=? "
                 "AND status='applied' AND collection_generation>=? AND collection_generation<?",
-                (self.store.profile_id, cursor, generation),
+                (
+                    self.store.profile_id,
+                    context.source.collection_generation,
+                    generation,
+                ),
             ).fetchall()
         finally:
             db.close()
         edges = []
         for device, session in scopes:
-            events = {row.sequence: row for row in self.store.query_compact_events(device, session)}
+            events = {
+                row.sequence: row
+                for row in self.store.query_compact_events(device, session)
+            }
             for app in self.store.query_compact_applications(device, session):
-                if app.status == "applied" and cursor <= app.collection_generation < generation:
-                    edges.append((events.get(app.sequence), app))
-        while cursor < generation:
-            candidates = [(event, app) for event, app in edges if app.collection_generation == cursor]
-            if len(candidates) != 1:
-                raise CompactApplicationError("snapshot_counter_receipt_path_invalid", "冻结基线之后的代数链有缺口或分叉")
-            event, app = candidates[0]
-            if event is None or app.collection_identity != collection_identity or app.collection_generation_after != cursor + 1:
-                raise CompactApplicationError("snapshot_counter_receipt_path_invalid", "冻结基线之后的代数边不连续")
-            after = self._validated_receipt_after(event, app)
-            if not app.before_json or _sha_text(app.before_json) != app.before_hash:
-                raise CompactApplicationError("snapshot_counter_receipt_path_invalid", "收据 before 摘要不符")
-            before = _parse_object(app.before_json, "snapshot_counter_receipt_path_invalid")
-            before_counters, after_counters = before.get("counters"), after.get("counters")
-            if not isinstance(before_counters, Mapping) or not before_counters or not isinstance(after_counters, Mapping) or set(before_counters) != set(after_counters):
-                raise CompactApplicationError("snapshot_counter_receipt_path_invalid", "收据缺少完整计数范围")
-            for did, value in before_counters.items():
-                if did in counters and counters[did] != value:
-                    raise CompactApplicationError("snapshot_counter_baseline_conflict", "收据计数与冻结基线推进结果不符")
-            # 未捕获牌组只影响自身；捕获的共同祖先仍必须逐边一致。
-            for did, value in after_counters.items():
-                if did in counters:
-                    counters[did] = value
-            cursor += 1
-        return counters
+                if (
+                    app.status != "applied"
+                    or not context.source.collection_generation
+                    <= app.collection_generation
+                    < generation
+                ):
+                    continue
+                event = events.get(app.sequence)
+                if event is None:
+                    raise CompactApplicationError(
+                        "snapshot_counter_receipt_path_invalid", "评分收据没有对应事件"
+                    )
+                after = self._validated_receipt_after(event, app)
+                before = _parse_object(
+                    app.before_json, "snapshot_counter_receipt_path_invalid"
+                )
+                edges.append(
+                    {
+                        "generation": app.collection_generation,
+                        "after_generation": app.collection_generation_after,
+                        "identity": app.collection_identity,
+                        "before": before.get("counters"),
+                        "after": after.get("counters"),
+                        "receipt_hash": app.receipt_hash,
+                    }
+                )
+        try:
+            return resolve_counter_baseline(
+                context, collection_identity, generation, edges, allow_gaps=allow_gaps
+            )
+        except CompactProjectionError as error:
+            raise CompactApplicationError(error.code, error.message) from error
 
     def _snapshot(self, snapshot_id: str) -> Any:
         try:

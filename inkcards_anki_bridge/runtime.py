@@ -16,13 +16,17 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from .device.auth import DeviceAuthenticator
 from .device.routes import DeviceRouter, RouteLimits
+from .device.request_log import DeviceRequestLog
 from .device.server import DeviceServer, ServerLimits
+from .logging_control import AddonLogger, DEFAULT_LOGGING_POLICY
 from .anki.catalog_jobs import CatalogJob, CatalogJobManager, DeckCatalog, DeckPreflight
 from .anki.compact_jobs import CompactJob, CompactJobManager
 from .anki.operations import OperationContext
-from .anki.snapshot_jobs import SnapshotJob, SnapshotJobError, SnapshotJobManager, SnapshotJobState
+from .anki.snapshot_jobs import SnapshotJob, SnapshotJobError, SnapshotJobManager, SnapshotJobState, make_scope
+from .sync_policy import SyncPolicyStore, SyncPolicyError
 from .services.inbox import InboxService
 from .services.snapshots import PublishedSnapshot, SnapshotError, SnapshotService
+from .services.snapshot_files import SnapshotFilesService
 from .storage import ProfileStore, SCHEMA_VERSION
 
 
@@ -68,6 +72,7 @@ class AddonRuntime:
         port: int = DEFAULT_PORT,
         route_limits: Optional[RouteLimits] = None,
         server_limits: Optional[ServerLimits] = None,
+        logging_core: Optional[AddonLogger] = None,
     ) -> None:
         if root is None:
             root = profile_root
@@ -81,6 +86,7 @@ class AddonRuntime:
         self._port = validate_bind_port(port)
         self._route_limits = route_limits
         self._server_limits = server_limits
+        self._logging_core = logging_core or AddonLogger(self._root, policy=DEFAULT_LOGGING_POLICY)
         self._lock = threading.RLock()
         self._state = "stopped"
         self._accepting = False
@@ -95,12 +101,15 @@ class AddonRuntime:
         self._snapshots: Optional[SnapshotService] = None
         self._router: Optional[DeviceRouter] = None
         self._server: Optional[DeviceServer] = None
+        self._preparation = None
         self._snapshot_jobs: Optional[SnapshotJobManager] = None
         self._catalog_jobs: Optional[CatalogJobManager] = None
         self._compact_jobs: Optional[CompactJobManager] = None
         self._compact_capability: Dict[str, Any] = {}
         self._refresh_lock = threading.RLock()
         self._refresh_requests: Dict[str, Dict[str, Any]] = {}
+        self._sync_policy = SyncPolicyStore(self._root, self._profile_id)
+        self._sync_state: Dict[str, Any] = {"stage": "idle", "state": "idle", "error": None}
 
     @property
     def profile_id(self) -> str:
@@ -109,6 +118,15 @@ class AddonRuntime:
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def logging_core(self) -> AddonLogger:
+        return self._logging_core
+
+    def configure_logging(self, policy: Any) -> dict[str, Any]:
+        """立即更新当前 profile 的日志级别和输出开关。"""
+
+        return self._logging_core.configure(policy, root=self._root)
 
     @property
     def runtime_epoch(self) -> Optional[str]:
@@ -224,24 +242,30 @@ class AddonRuntime:
                 collection_generation = store.get_collection_generation()
                 auth = DeviceAuthenticator(store)
                 inbox = InboxService(store)
-                snapshots = SnapshotService(store)
+                snapshots = SnapshotService(store, page_bytes=32768)  # 图文实验只走文件传输，保留完整图文记录的预算。
+                snapshot_files = SnapshotFilesService(store)
                 # P4 snapshot/pull route 只有在这里明确注入后才存在；没有发布
                 # snapshot 或有 pending/unknown application 时，storage gate 仍拒绝 pull。
                 router = DeviceRouter(
                     auth,
                     inbox,
                     snapshot_service=snapshots,
+                    snapshot_files_service=snapshot_files,
                     refresh_handler=self.refresh_pull,
+                    ready_scope_reader=self.default_sync_scope_id,
+                    sync_observer=self._observe_device_sync,
                     compact_job_requester=self.request_compact_apply,
                     compact_job_status_reader=self.compact_apply_status,
                     compact_capability_reader=self.compact_capabilities,
                     limits=self._route_limits,
+                    logger=self._logging_core,
                 )
                 server = DeviceServer(
                     router,
                     host=self._host,
                     port=self._port,
                     limits=self._server_limits,
+                    request_log=DeviceRequestLog(store.root, logger=self._logging_core),
                 )
                 server.start()
                 self._store = store
@@ -289,6 +313,7 @@ class AddonRuntime:
                 return
             self._state = "stopping"
             self._accepting = False
+            preparation, self._preparation = self._preparation, None
             server = self._server
             snapshots = self._snapshots
             store = self._store
@@ -308,6 +333,8 @@ class AddonRuntime:
             # closure 可能仍由 Anki 宿主完成，但不能再更新旧 runtime 缓存。
             self._runtime_epoch = None
         try:
+            if preparation is not None:
+                preparation.close()
             if snapshot_jobs is not None:
                 snapshot_jobs.stop()
             if catalog_jobs is not None:
@@ -329,7 +356,7 @@ class AddonRuntime:
     shutdown = stop
 
     def issue_pairing_code(self, **kwargs: Any) -> str:
-        """给后续 Qt UI 的窄配对入口；不返回长期 token。"""
+        """兼容旧调用；当前 Qt 设备管理通过具名名额创建固定码。"""
 
         auth = self._require_running().auth
         assert auth is not None
@@ -341,6 +368,48 @@ class AddonRuntime:
         store = self._require_running().store
         assert store is not None
         store.revoke_device(device_id)
+
+    def add_device(self, name: str) -> dict[str, Any]:
+        """在本机 UI 添加一个设备名额并返回一次性固定配对码。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        return auth.add_device(name)
+
+    def list_devices(self, *, include_revoked: bool = False) -> list[dict[str, Any]]:
+        """列出设备名额；认证层不会在列表中返回配对码或 token。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        return auth.list_devices(include_revoked=include_revoked)
+
+    def allow_rebind(self, slot_id: str) -> None:
+        """由本机管理 UI 明确允许设备名额重新绑定。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        auth.allow_rebind(slot_id)
+
+    def reset_pairing_code(self, slot_id: str) -> dict[str, Any]:
+        """使旧配对码失效，并一次性返回新固定配对码。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        return auth.reset_pairing_code(slot_id)
+
+    def remove_device(self, slot_id: str) -> None:
+        """撤销名额的凭据与会话，但保留业务历史。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        auth.remove_device(slot_id)
+
+    def rename_device(self, slot_id: str, name: str) -> None:
+        """更新本机设备列表显示名称。"""
+
+        auth = self._require_running().auth
+        assert auth is not None
+        auth.rename_device(slot_id, name)
 
     def publish_snapshot(
         self,
@@ -457,6 +526,45 @@ class AddonRuntime:
             return None
         return manager.status_for(device_id, session_id)
 
+    def get_sync_policy(self) -> Dict[str, Any]:
+        return self._sync_policy.read()
+
+    def set_excluded_decks(self, ids: Any) -> Dict[str, Any]:
+        with self._lock:
+            result = self._sync_policy.save(ids)
+        if getattr(self, "_preparation", None) is not None:
+            self._preparation.invalidate()
+        return result
+
+    def default_sync_scope_id(self) -> str:
+        policy = self.get_sync_policy()
+        return make_scope(card_ids=None, deck_ids=None,
+                          excluded_deck_ids=policy["excluded_deck_ids"]).scope_id
+
+    def _observe_device_sync(self, stage: str, **details: Any) -> None:
+        with self._lock:
+            if stage == "committed" and details.get("transfer_id") and self._store is not None:
+                def committed_time(db: Any) -> Any:
+                    row = db.execute("SELECT updated_at_ms FROM artifact_transfers WHERE profile_id=? "
+                        "AND transfer_id=? AND device_id=? AND session_id=? AND status='committed'",
+                        (self.profile_id, details["transfer_id"], details.get("device_id"),
+                         details.get("session_id"))).fetchone()
+                    return int(row[0]) if row is not None else None
+                try:
+                    timestamp = self._store._read(committed_time)
+                except Exception:
+                    timestamp = None
+                if timestamp is not None:
+                    details.update(updated_at_ms=timestamp, completed_at_ms=timestamp)
+            previous_error = self._sync_state.get("error")
+            incoming_error = details.get("error")
+            if (isinstance(previous_error, dict) and isinstance(incoming_error, dict)
+                    and previous_error.get("code") == incoming_error.get("code")):
+                details["error"] = {**previous_error, **incoming_error}
+            self._sync_state = {**self._sync_state, "stage": stage,
+                "state": "completed" if stage == "committed" else "failed" if stage == "failed" else "active",
+                "error": None, "updated_at_ms": int(time.time() * 1000), **details}
+
     def request_snapshot(self, *, card_ids: Any = None, deck_ids: Any = None) -> SnapshotJob:
         """后续 UI/HTTP 使用的最小只读请求入口。"""
 
@@ -478,9 +586,34 @@ class AddonRuntime:
     ) -> Tuple[int, Dict[str, Any]]:
         """设备显式同步时提交/轮询 QueryOp；HTTP worker 不读取 collection。"""
 
-        with self._lock:
+        preparation = self._preparation
+        if preparation is not None:
+            return preparation.refresh(device_id=device_id, session_id=session_id,
+                scope_id=scope_id, base_snapshot_id=base_snapshot_id, refresh_token=refresh_token)
+
+        # 发布会同时持有 runtime/job 锁。已绑定的进度查询不读取未提交数据，
+        # 此时只返回准备中；ready 路径仍需锁、会话 gate 和发布结果校验。
+        if not self._lock.acquire(blocking=False):
+            if refresh_token is None or not self._refresh_lock.acquire(blocking=False):
+                raise SnapshotError("snapshot_refresh_busy", status=503, retryable=True)
+            try:
+                item = self._refresh_requests.get(refresh_token)
+                if item is None or time.monotonic() - item["created_at"] > 600 or any(
+                    item[key] != value for key, value in (
+                        ("device_id", device_id), ("session_id", session_id),
+                        ("scope_id", scope_id), ("base_snapshot_id", base_snapshot_id),
+                    )
+                ):
+                    raise SnapshotError("snapshot_refresh_token_invalid", status=409)
+                return 202, {"protocol": "x4-2", "profile_id": self.profile_id,
+                             "scope_id": scope_id, "refresh_token": refresh_token, "state": "pending"}
+            finally:
+                self._refresh_lock.release()
+        try:
             manager, service, store = self._snapshot_jobs, self._snapshots, self._store
             running = self._state == "running"
+        finally:
+            self._lock.release()
         if not running or manager is None or service is None or store is None:
             raise SnapshotError("snapshot_refresh_unavailable", status=503, retryable=True)
         gate = store.pull_gate(device_id, session_id)
@@ -494,11 +627,21 @@ class AddonRuntime:
             if refresh_token is None:
                 if len(self._refresh_requests) >= 64:
                     raise SnapshotError("snapshot_refresh_busy", status=503, retryable=True)
-                source = service.refresh_scope(scope_id)
+                try:
+                    policy = self.get_sync_policy()
+                except SyncPolicyError as error:
+                    raise SnapshotError(error.code, status=409) from None
+                default_scope = make_scope(card_ids=None, deck_ids=None,
+                                           excluded_deck_ids=policy["excluded_deck_ids"])
+                source = ({"kind": "exclude", "ids": list(default_scope.ids)}
+                          if scope_id == default_scope.scope_id else service.refresh_scope(scope_id))
+                if source["kind"] == "exclude" and scope_id != default_scope.scope_id:
+                    raise SnapshotError("snapshot_refresh_scope_changed", status=409)
                 try:
                     job = manager.request_snapshot(
                         card_ids=source["ids"] if source["kind"] == "card" else None,
                         deck_ids=source["ids"] if source["kind"] == "deck" else None,
+                        **({"excluded_deck_ids": source["ids"]} if source["kind"] == "exclude" else {}),
                         applied_watermark=gate.applied_watermark or 0,
                     )
                 except SnapshotJobError as error:
@@ -521,6 +664,8 @@ class AddonRuntime:
                     "created_at": now,
                 }
                 self._refresh_requests[refresh_token] = item
+                self._observe_device_sync("preparing", device_id=device_id, session_id=session_id,
+                                          scope_id=scope_id, job_id=job.job_id if hasattr(job, "job_id") else None)
             else:
                 item = self._refresh_requests.get(refresh_token)
                 if item is None or any(item[key] != value for key, value in (
@@ -535,8 +680,9 @@ class AddonRuntime:
             "scope_id": scope_id,
             "refresh_token": refresh_token,
         }
-        state = job.state
-        if state in {SnapshotJobState.CREATED, SnapshotJobState.QUEUED,
+        poll_state = getattr(job, "poll_state", None)
+        state = poll_state() if callable(poll_state) else job.state
+        if state is None or state in {SnapshotJobState.CREATED, SnapshotJobState.QUEUED,
                      SnapshotJobState.STARTED, SnapshotJobState.PUBLISHING}:
             return 202, {**common, "state": "pending"}
         if state is SnapshotJobState.STALE_RESULT_DROPPED:
@@ -544,7 +690,12 @@ class AddonRuntime:
         if state is SnapshotJobState.CANCELED:
             raise SnapshotError("snapshot_refresh_canceled", status=409)
         if state is not SnapshotJobState.PUBLISHED or job.result is None:
-            raise SnapshotError("snapshot_refresh_failed", status=409)
+            error = getattr(job, "error", None)
+            with self._lock:
+                self._sync_state = {"stage": "preparing", "state": "failed",
+                    "error": {"code": getattr(error, "code", "snapshot_refresh_failed"),
+                              "message": str(error) if error else "快照准备失败"}}
+            raise SnapshotError(getattr(error, "code", "snapshot_refresh_failed"), status=409)
         publication = job.result
         if publication.scope_id != scope_id:
             raise SnapshotError("snapshot_refresh_scope_invalid", status=409)
@@ -552,6 +703,8 @@ class AddonRuntime:
         if not gate.allowed:
             raise SnapshotError(gate.reason or "pull_gate_blocked", status=409)
         result = service.refresh_result(scope_id, base_snapshot_id, publication.snapshot_id)
+        self._observe_device_sync("prepared", device_id=device_id, session_id=session_id,
+                                  scope_id=scope_id, snapshot_id=publication.snapshot_id)
         return 200, {**common, "state": "ready", **result}
 
     def cancel_snapshot(self, job_id: str) -> bool:
@@ -613,6 +766,8 @@ class AddonRuntime:
             if current != generation:
                 raise RuntimeError("Store generation changed before compact cache refresh")
             self._collection_generation = generation
+        if getattr(self, "_preparation", None) is not None:
+            self._preparation.invalidate()
 
     def set_compact_capability(self, report: Mapping[str, Any]) -> None:
         with self._lock:
@@ -640,7 +795,9 @@ class AddonRuntime:
             before = int(self._store.get_collection_generation())
             self._store.set_collection_generation(before + 1)
             self._collection_generation = before + 1
-            return before + 1
+        if getattr(self, "_preparation", None) is not None:
+            self._preparation.invalidate()
+        return before + 1
 
     def status(self) -> Dict[str, Any]:
         """返回不包含 profile path、显示名、token 或 raw payload 的状态。"""
@@ -691,8 +848,49 @@ class AddonRuntime:
                 "snapshot_limit": last_preflight.snapshot_limit if last_preflight is not None else None,
                 "within_limit": last_preflight.within_limit if last_preflight is not None else None,
             },
+            "preparation": self._preparation.status() if self._preparation is not None else None,
             "persistence": counts,
+            "sync": self._current_sync_status(),
         }
+
+    def _current_sync_status(self) -> Dict[str, Any]:
+        with self._lock:
+            result = dict(self._sync_state)
+        try:
+            self.get_sync_policy()
+        except SyncPolicyError as error:
+            return {"stage": "policy", "state": "failed",
+                    "error": {"code": error.code, "message": error.message}}
+        if result["stage"] == "idle":
+            with self._lock:
+                store = self._store
+            if store is not None:
+                def read(db: Any) -> Any:
+                    return db.execute("SELECT device_id,session_id,transfer_id,snapshot_id,updated_at_ms "
+                        "FROM artifact_transfers WHERE profile_id=? AND status='committed' "
+                        "ORDER BY updated_at_ms DESC LIMIT 1", (self.profile_id,)).fetchone()
+                try:
+                    recent = store._read(read)
+                except Exception:
+                    recent = None
+                if recent is not None:
+                    result = {"stage": "committed", "state": "completed", "error": None,
+                              "completed_at_ms": int(recent["updated_at_ms"]), **dict(recent)}
+        # UI轮询也能看到后台作业失败，无需设备继续轮询才能更新。
+        with self._refresh_lock:
+            requests = list(self._refresh_requests.values())
+        if requests and result.get("stage") == "preparing":
+            job = requests[-1]["job"]
+            if job.state in {SnapshotJobState.FAILED, SnapshotJobState.CANCELED,
+                             SnapshotJobState.STALE_RESULT_DROPPED}:
+                error = getattr(job, "error", None)
+                result.update(state="failed", error={"code": getattr(error, "code", job.state.value),
+                              "message": str(error) if error else job.state.value})
+            elif job.state is SnapshotJobState.PUBLISHED:
+                result.update(stage="prepared", state="active")
+        return result
+
+    get_status = status
 
     diagnostics = status
 

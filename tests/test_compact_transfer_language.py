@@ -8,6 +8,7 @@ import anki.collection  # 必须先加载 Collection，避免 Anki 循环导入�
 import anki.lang
 from inkcards_anki_bridge.anki.compact_diagnostics import CompactDiagnostics
 from inkcards_anki_bridge.anki.compact_projection import json_sha256
+from inkcards_anki_bridge.logging_control import AddonLogger
 from test_adopted_restore import adopted_fixture
 from test_compact_service import DEVICE, SESSION, SyntheticFixture
 
@@ -30,7 +31,13 @@ class CompactTransferLanguageTests(unittest.TestCase):
                             fixture.service.import_adopted_source(
                                 source, expected_sha256=json_sha256(source)
                             )
-                            sink = CompactDiagnostics(fixture.store.root)
+                            sink = CompactDiagnostics(
+                                fixture.store.root,
+                                logger=AddonLogger(
+                                    fixture.store.root,
+                                    policy={"level": "debug", "console": False},
+                                ),
+                            )
                             fixture.service.diagnostics = sink
                             anki.lang.set_lang(language)
                             result = fixture.apply_one()

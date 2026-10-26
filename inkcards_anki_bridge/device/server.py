@@ -18,6 +18,7 @@ from typing import Any, Mapping, Optional, Tuple
 
 from .codec import encode_json, error_envelope
 from .routes import DeviceRouter, RouteResponse
+from .request_log import DeviceRequestLog
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,8 @@ class ServerLimits:
     work_queue_size: int = 8
     max_connections: int = 12
     read_timeout: float = 2.0
+    body_timeout: float = 5.0
+    body_total_timeout: float = 10.0
     write_timeout: float = 2.0
     shutdown_timeout: float = 2.0
 
@@ -35,12 +38,12 @@ class ServerLimits:
                 raise ValueError("server counts must be positive integers")
         if self.max_connections < self.max_workers:
             raise ValueError("max_connections must cover workers")
-        for value in (self.read_timeout, self.write_timeout, self.shutdown_timeout):
+        for value in (self.read_timeout, self.body_timeout, self.body_total_timeout, self.write_timeout, self.shutdown_timeout):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise ValueError("server timeouts must be positive")
 
 
-def _raw_rejection(request: socket.socket, status: int, code: str) -> None:
+def _raw_rejection(request: socket.socket, status: int, code: str) -> int:
     body = b'{"error":{"code":"%s"}}' % code.encode("ascii")
     response = (
         b"HTTP/1.1 "
@@ -55,8 +58,9 @@ def _raw_rejection(request: socket.socket, status: int, code: str) -> None:
     try:
         request.settimeout(0.25)
         request.sendall(response)
+        return len(body)
     except (OSError, socket.timeout):
-        pass
+        return len(body)
 
 
 class _BoundedHTTPServer(socketserver.TCPServer):
@@ -68,9 +72,11 @@ class _BoundedHTTPServer(socketserver.TCPServer):
         handler_class: Any,
         router: DeviceRouter,
         limits: ServerLimits,
+        request_log: Optional[DeviceRequestLog] = None,
     ) -> None:
         self.router = router
         self.limits = limits
+        self.request_log = request_log
         self.request_queue_size = max(1, limits.work_queue_size)
         self._queue: "queue.Queue[Optional[Tuple[socket.socket, Any]]]" = queue.Queue(
             maxsize=limits.work_queue_size
@@ -97,6 +103,8 @@ class _BoundedHTTPServer(socketserver.TCPServer):
             self._workers.append(worker)
 
     def process_request(self, request: socket.socket, client_address: Any) -> None:
+        measure = self.request_log is not None and self.request_log.should_measure_request()
+        started_at = time.monotonic() if measure else None
         accepted = False
         with self._connections_lock:
             # 关闭标记、连接登记和入队必须原子化，避免请求落到终止标记之后。
@@ -109,7 +117,20 @@ class _BoundedHTTPServer(socketserver.TCPServer):
                     self._connections.discard(request)
                     self._slots.release()
         if not accepted:
-            _raw_rejection(request, 503, "server_busy")
+            response_bytes = _raw_rejection(request, 503, "server_busy")
+            if self.request_log is not None and measure:
+                try:
+                    self.request_log.record(
+                        method=None,
+                        target=None,
+                        status=503,
+                        error_code="server_busy",
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                        request_body_bytes=0,
+                        response_body_bytes=response_bytes,
+                    )
+                except Exception:
+                    pass
             self.shutdown_request(request)
 
     def _worker(self) -> None:
@@ -201,6 +222,91 @@ class _RequestHandler(http.server.BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(self._x4_server.limits.read_timeout)
 
+    def handle_one_request(self) -> None:
+        request_log = self._x4_server.request_log
+        self._x4_logging_enabled = (
+            request_log is not None and request_log.should_measure_request()
+        )
+        self._x4_started_at = time.monotonic() if self._x4_logging_enabled else None
+        self._x4_request_body_bytes = 0
+        self._x4_response_status: Optional[int] = None
+        self._x4_response_body_bytes = 0
+        self._x4_error_code: Optional[str] = None
+        self._x4_exception: Optional[BaseException] = None
+        self._x4_stage = "request_headers"
+        self._x4_expected_body_bytes = 0
+        try:
+            super().handle_one_request()
+        except (OSError, socket.timeout) as error:
+            self._x4_error_code = self._x4_error_code or "request_read_error"
+            self._x4_exception = error
+            raise
+        except Exception as error:
+            self._x4_error_code = self._x4_error_code or "request_handling_error"
+            self._x4_exception = error
+            raise
+        finally:
+            raw_requestline = getattr(self, "raw_requestline", b"")
+            if (
+                self._x4_response_status is None
+                and self._x4_error_code is None
+                and raw_requestline
+            ):
+                self._x4_error_code = "request_read_error"
+            if (
+                self._x4_logging_enabled
+                and self._x4_server.request_log is not None
+                and (self._x4_response_status is not None or self._x4_error_code is not None)
+            ):
+                try:
+                    self._x4_server.request_log.record(
+                        method=getattr(self, "command", None),
+                        target=getattr(self, "path", None),
+                        status=self._x4_response_status,
+                        error_code=self._x4_error_code,
+                        elapsed_ms=int((time.monotonic() - self._x4_started_at) * 1000),
+                        request_body_bytes=self._x4_request_body_bytes,
+                        response_body_bytes=self._x4_response_body_bytes,
+                        stage=self._x4_stage,
+                        expected_body_bytes=self._x4_expected_body_bytes,
+                        exception=self._x4_exception,
+                    )
+                except Exception:
+                    pass
+
+    def send_response(self, code: int, message: Optional[str] = None) -> None:
+        self._x4_response_status = code
+        super().send_response(code, message)
+
+    def send_header(self, keyword: str, value: str) -> None:
+        if self._x4_logging_enabled and keyword.lower() == "content-length":
+            try:
+                size = max(0, int(value))
+                self._x4_response_body_bytes = (
+                    0 if getattr(self, "command", None) == "HEAD" else size
+                )
+            except (TypeError, ValueError):
+                self._x4_response_body_bytes = 0
+        super().send_header(keyword, value)
+
+    def log_error(self, format: str, *args: Any) -> None:
+        if format == "Request timed out: %r":
+            self._x4_error_code = "request_read_error"
+
+    def send_error(
+        self,
+        code: int,
+        message: Optional[str] = None,
+        explain: Optional[str] = None,
+    ) -> None:
+        self._x4_response_status = code
+        self._x4_error_code = {
+            400: "malformed_request",
+            414: "request_target_too_long",
+            501: "unsupported_method",
+        }.get(code, "http_error")
+        super().send_error(code, message, explain)
+
     def log_message(self, format: str, *args: Any) -> None:
         # 不记录 Authorization、请求 body 或异常原文。
         return
@@ -222,6 +328,15 @@ class _RequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _write(self, status: int, body: bytes, headers: Optional[Mapping[str, str]] = None) -> None:
         self.close_connection = True
+        self._x4_response_status = status
+        if self._x4_logging_enabled:
+            self._x4_response_body_bytes = len(body)
+        request_log = self._x4_server.request_log
+        self._x4_error_code = (
+            request_log.error_code_from_response(status, body)
+            if request_log is not None and self._x4_logging_enabled
+            else None
+        )
         try:
             self.connection.settimeout(self._x4_server.limits.write_timeout)
             self.send_response(status)
@@ -263,25 +378,41 @@ class _RequestHandler(http.server.BaseHTTPRequestHandler):
         if length < 0:
             self._error(400, "invalid_content_length")
             return None
-        if length > self._x4_server.router.limits.max_request_bytes:
+        if length > self._x4_server.router.request_limit_for(method, self.path):
             self._error(413, "request_too_large")
             return None
+        self._x4_expected_body_bytes = length
+        self._x4_stage = "request_body"
+        deadline = time.monotonic() + self._x4_server.limits.body_total_timeout
         chunks = []
         remaining = length
         while remaining:
-            chunk = self.rfile.read(min(remaining, 8192))
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                raise TimeoutError("body read deadline")
+            self.connection.settimeout(min(self._x4_server.limits.body_timeout, budget))
+            # read1 返回已经收到的部分，超时时也能准确报告字节进度。
+            chunk = self.rfile.read1(min(remaining, 8192))
             if not chunk:
                 self._error(400, "request_body_incomplete")
                 return None
             chunks.append(chunk)
+            if self._x4_logging_enabled:
+                self._x4_request_body_bytes += len(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
 
     def _handle_request(self, method: str) -> None:
-        body = self._read_body(method)
+        try:
+            body = self._read_body(method)
+        except (OSError, socket.timeout) as error:
+            self._x4_exception = error
+            self._error(408, "request_body_timeout")
+            return
         if body is None:
             return
         try:
+            self._x4_stage = "request_dispatch"
             response: RouteResponse = self._x4_server.router.dispatch(
                 method, self.path, dict(self.headers.items()), body
             )
@@ -301,13 +432,17 @@ class DeviceServer:
         host: str = "127.0.0.1",
         port: int = 0,
         limits: Optional[ServerLimits] = None,
+        request_log: Optional[DeviceRequestLog] = None,
     ) -> None:
         if not isinstance(router, DeviceRouter):
             raise TypeError("router must be a DeviceRouter")
         self.router = router
         self.limits = limits or ServerLimits()
+        if request_log is not None and not isinstance(request_log, DeviceRequestLog):
+            raise TypeError("request_log must be a DeviceRequestLog")
+        self.request_log = request_log or DeviceRequestLog(router.store.root)
         self._httpd = _BoundedHTTPServer(
-            (host, port), _RequestHandler, router, self.limits
+            (host, port), _RequestHandler, router, self.limits, self.request_log
         )
         self._thread: Optional[threading.Thread] = None
         self._state_lock = threading.RLock()

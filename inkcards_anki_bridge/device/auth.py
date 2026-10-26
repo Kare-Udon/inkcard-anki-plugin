@@ -12,11 +12,13 @@ import re
 import secrets as _stdlib_secrets
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Deque, Dict, Mapping, Optional, Tuple
 
-from ..storage import ProfileStore, SessionRecord
+from ..storage import ProfileStore, SessionRecord, StorageValidationError
+from ..storage.device_management import PairingStateError
 
 
 _IDENTIFIER = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
@@ -72,11 +74,13 @@ class RuntimeSession:
     created_at_ms: int
 
 
-@dataclass
-class _PairingRecord:
-    code_hash: str
-    expires_at_ms: int
-    used_at_ms: Optional[int] = None
+class _CodeResult(dict):
+    """管理调用可读取原码，但诊断 repr 不包含秘密。"""
+
+    def __repr__(self):
+        return repr({key: ("<redacted>" if key == "code" else value) for key, value in self.items()})
+
+    __str__ = __repr__
 
 
 def _default_clock() -> int:
@@ -88,7 +92,7 @@ def _valid_identifier(value: Any) -> bool:
 
 
 class DeviceAuthenticator:
-    """管理短时一次性 pairing code、长期 token hash 验证和 session。"""
+    """管理固定配对码、持久凭据事务和运行时 session。"""
 
     def __init__(
         self,
@@ -120,11 +124,10 @@ class DeviceAuthenticator:
         self.store = store
         self._clock = clock or _default_clock
         self._entropy = secrets_source or secrets or _stdlib_secrets
-        self._pairing_ttl_ms = pairing_ttl_ms
+        # 仅保留旧 Python 构造参数兼容；固定码不使用 TTL。
         self._max_pairing_attempts = max_pairing_attempts
         self._pairing_attempt_window_ms = pairing_attempt_window_ms
         self._lock = threading.RLock()
-        self._pairings: Dict[str, _PairingRecord] = {}
         self._attempts: Deque[int] = deque()
         self._sessions: Dict[Tuple[str, str, str], RuntimeSession] = {}
 
@@ -144,13 +147,6 @@ class DeviceAuthenticator:
         cutoff = now_ms - self._pairing_attempt_window_ms
         while self._attempts and self._attempts[0] <= cutoff:
             self._attempts.popleft()
-        expired = [
-            key
-            for key, record in self._pairings.items()
-            if record.used_at_ms is not None or record.expires_at_ms <= now_ms
-        ]
-        for key in expired:
-            del self._pairings[key]
 
     def _record_failed_attempt(self, now_ms: int) -> None:
         self._attempts.append(now_ms)
@@ -163,18 +159,7 @@ class DeviceAuthenticator:
         if self._rate_limited(now_ms):
             return AuthError("pairing_rate_limited", status=429, retryable=True)
         self._record_failed_attempt(now_ms)
-        return AuthError("invalid_or_expired_pairing_code")
-
-    def _randbelow(self, upper: int) -> int:
-        generator = getattr(self._entropy, "randbelow", None)
-        if callable(generator):
-            value = generator(upper)
-        else:
-            raw = self._token_bytes(8)
-            value = int.from_bytes(raw, "big") % upper
-        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < upper:
-            raise ValueError("entropy returned an invalid integer")
-        return value
+        return AuthError("invalid_pairing_code")
 
     def _token_bytes(self, length: int) -> bytes:
         generator = getattr(self._entropy, "token_bytes", None)
@@ -185,48 +170,134 @@ class DeviceAuthenticator:
             raise ValueError("entropy returned an invalid token")
         return bytes(raw)
 
-    def issue_pairing_code(self, *, now_ms: Optional[int] = None, ttl_ms: Optional[int] = None) -> str:
-        """生成一次性六位码；原文只由调用方拿到，不写入 storage。"""
+    @staticmethod
+    def _digest(value: str) -> str:
+        return hashlib.sha256(value.encode("ascii")).hexdigest()
 
-        now = self._now(now_ms)
-        ttl = self._pairing_ttl_ms if ttl_ms is None else ttl_ms
-        if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
-            raise ValueError("invalid pairing ttl")
-        with self._lock:
-            self._sweep(now)
-            for _ in range(8):
-                code = "%06d" % self._randbelow(1_000_000)
-                digest = hashlib.sha256(code.encode("ascii")).hexdigest()
-                if digest not in self._pairings:
-                    self._pairings[digest] = _PairingRecord(digest, now + ttl)
-                    return code
+    @staticmethod
+    def _management_error(error: PairingStateError) -> AuthError:
+        status = {
+            "invalid_pairing_code": 401,
+            "device_revoked": 403,
+            "unknown_device_slot": 404,
+        }.get(error.code, 409)
+        return AuthError(error.code, status=status)
+
+    def _code(self) -> str:
+        # 与客户端 token 独立的系统熵；不依赖时间或进程内计数器。
+        return "%012d" % (int.from_bytes(self._token_bytes(16), "big") % 1_000_000_000_000)
+
+    def add_device(self, name: str) -> dict:
+        if not _valid_identifier(name) or not name.strip():
+            raise AuthError("invalid_device_name", status=422)
+        slot_id = "slot_" + uuid.uuid4().hex
+        for _ in range(8):
+            code = self._code()
+            try:
+                self.store.add_device_slot(slot_id, name, self._digest(code), self._now())
+                return _CodeResult(slot_id=slot_id, name=name, status="pending", code=code)
+            except PairingStateError as error:
+                if error.code != "pairing_code_collision":
+                    raise self._management_error(error) from error
         raise AuthError("pairing_unavailable", status=503, retryable=True)
+
+    def list_devices(self, include_revoked: bool = False) -> list:
+        return self.store.list_device_slots(include_revoked)
+
+    def _manage(self, slot_id: str, action: str, **fields):
+        if not _valid_identifier(slot_id):
+            raise AuthError("invalid_device_slot", status=422)
+        try:
+            return self.store.manage_device_slot(slot_id, action, now=self._now(), **fields)
+        except PairingStateError as error:
+            raise self._management_error(error) from error
+
+    def allow_rebind(self, slot_id: str) -> None:
+        self._manage(slot_id, "allow_rebind")
+
+    def reset_pairing_code(self, slot_id: str) -> dict:
+        for _ in range(8):
+            code = self._code()
+            try:
+                self._manage(slot_id, "reset", code_hash=self._digest(code))
+                return _CodeResult(slot_id=slot_id, code=code)
+            except AuthError as error:
+                if error.code != "pairing_code_collision":
+                    raise
+        raise AuthError("pairing_unavailable", status=503, retryable=True)
+
+    def remove_device(self, slot_id: str) -> None:
+        removed = self._manage(slot_id, "remove")
+        # 持久撤销先完成；不在提交后再读数据库而产生误报失败。
+        with self._lock:
+            self._sessions = {key: value for key, value in self._sessions.items() if value.device_id != removed}
+
+    def rename_device(self, slot_id: str, name: str) -> None:
+        if not _valid_identifier(name) or not name.strip():
+            raise AuthError("invalid_device_name", status=422)
+        self._manage(slot_id, "rename", name=name)
+
+    def issue_pairing_code(self, *, now_ms: Optional[int] = None, ttl_ms: Optional[int] = None) -> str:
+        """Python 夹具兼容入口：创建具名固定名额；HTTP 不提供此操作。"""
+        return self.add_device("阅读器")["code"]
 
     create_pairing_code = issue_pairing_code
 
-    def pair(self, code: str, device_id: str, *, now_ms: Optional[int] = None) -> DeviceCredential:
-        """校验 code 后注册设备；只有 register_device 成功才消耗 code。"""
-
-        now = self._now(now_ms)
-        if not _valid_identifier(device_id):
+    def _validate_transaction(self, device_id, pairing_id, token):
+        if not _valid_identifier(device_id) or not isinstance(pairing_id, str):
             raise AuthError("invalid_pair_request", status=422)
+        try:
+            valid_uuid = str(uuid.UUID(pairing_id)) == pairing_id
+        except (ValueError, AttributeError):
+            valid_uuid = False
+        if not valid_uuid or not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+            raise AuthError("invalid_pair_request", status=422)
+
+    def _pairing_response(self, device_id, pairing_id, status, *, capabilities=False):
+        result = {"protocol": "x4-2", "profile_id": self.store.profile_id, "device_id": device_id, "pairing_id": pairing_id, "status": status}
+        if capabilities:
+            result["capabilities"] = {"device_management_v1": True}
+        return result
+
+    def prepare_pairing(self, code: str, device_id: str, pairing_id: str, token: str, *, name=None, now_ms=None) -> dict:
+        self._validate_transaction(device_id, pairing_id, token)
+        if name is not None and not _valid_identifier(name):
+            raise AuthError("invalid_pair_request", status=422)
+        now = self._now(now_ms)
         with self._lock:
             if self._rate_limited(now):
                 raise AuthError("pairing_rate_limited", status=429, retryable=True)
-            if not isinstance(code, str) or len(code) != 6 or not code.isascii() or not code.isdigit():
+            if not isinstance(code, str) or re.fullmatch(r"[0-9]{12}", code) is None:
+                if isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code):
+                    self._record_failed_attempt(now)
+                    raise AuthError("pairing_code_upgrade_required", status=401)
                 raise self._pairing_failure(now)
-            digest = hashlib.sha256(code.encode("ascii")).hexdigest()
-            record = self._pairings.get(digest)
-            if record is None or record.used_at_ms is not None or record.expires_at_ms <= now:
-                raise self._pairing_failure(now)
-            token = self._token_bytes(32).hex()
             try:
-                self.store.register_device(device_id, token, now_ms=now)
-            except Exception:
-                # 注册失败时不标记 code 已使用，调用方得到的错误不包含 token 或设备输入。
-                raise AuthError("pairing_failed", status=503, retryable=True) from None
-            record.used_at_ms = now
-            return DeviceCredential(self.store.profile_id, device_id, token)
+                status = self.store.prepare_device_pairing(self._digest(code), device_id, pairing_id, self._digest(token), now)
+            except PairingStateError as error:
+                if error.code == "invalid_pairing_code":
+                    self._record_failed_attempt(now)
+                raise self._management_error(error) from error
+            return self._pairing_response(device_id, pairing_id, status, capabilities=True)
+
+    def confirm_pairing(self, device_id: str, pairing_id: str, token: str, *, now_ms=None) -> dict:
+        self._validate_transaction(device_id, pairing_id, token)
+        try:
+            removed = self.store.confirm_device_pairing(device_id, pairing_id, self._digest(token), self._now(now_ms))
+        except PairingStateError as error:
+            raise self._management_error(error) from error
+        if removed is not None:
+            with self._lock:
+                self._sessions = {key: value for key, value in self._sessions.items() if value.device_id != removed}
+        return self._pairing_response(device_id, pairing_id, "active")
+
+    def pair(self, code: str, device_id: str, *, now_ms: Optional[int] = None) -> DeviceCredential:
+        """仅 Python 测试便捷入口；完整经过 prepare 与 confirm。"""
+        token = self._token_bytes(32).hex()
+        pairing_id = str(uuid.uuid4())
+        self.prepare_pairing(code, device_id, pairing_id, token, now_ms=now_ms)
+        self.confirm_pairing(device_id, pairing_id, token, now_ms=now_ms)
+        return DeviceCredential(self.store.profile_id, device_id, token)
 
     pair_device = pair
 
@@ -237,10 +308,7 @@ class DeviceAuthenticator:
             char.isspace() for char in token
         ):
             raise AuthError("invalid_token")
-        try:
-            valid = self.store.verify_device_token(device_id, token)
-        except Exception:
-            valid = False
+        valid = self.store.verify_device_token(device_id, token)
         if not valid:
             raise AuthError("invalid_token")
         return AuthPrincipal(self.store.profile_id, device_id)
@@ -281,8 +349,8 @@ class DeviceAuthenticator:
             record: SessionRecord = self.store.open_session(
                 principal.device_id, session_id, now_ms=now_ms
             )
-        except Exception:
-            raise AuthError("session_unavailable", status=409) from None
+        except StorageValidationError as error:
+            raise AuthError("session_unavailable", status=409) from error
         runtime = RuntimeSession(
             record.profile_id,
             record.device_id,
