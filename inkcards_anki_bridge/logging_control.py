@@ -40,7 +40,7 @@ _ROUTES = frozenset(
 )
 _SAFE_FIELDS = frozenset(
     {
-        "method", "route", "status", "error_code", "elapsed_ms",
+        "method", "route", "status", "error_code", "elapsed_ms", "queue_ms",
         "request_body_bytes", "response_body_bytes", "stage", "code",
         "reason", "state", "exception_type", "traceback", "exception",
         "chain_truncated", "expected_body_bytes",
@@ -143,7 +143,7 @@ def _clean_field(key: str, value: Any) -> Any:
         return value if isinstance(value, str) and value in _ROUTES else "unknown"
     if key in {"status"}:
         return value if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599 else None
-    if key in {"elapsed_ms", "request_body_bytes", "response_body_bytes", "expected_body_bytes"}:
+    if key in {"elapsed_ms", "queue_ms", "request_body_bytes", "response_body_bytes", "expected_body_bytes"}:
         return _safe_count(value)
     if key in {"error_code", "code", "reason", "stage", "state"}:
         return _safe_code(value)
@@ -289,6 +289,18 @@ class AddonLogger:
             if number is None or level == "off":
                 return False
             return self._logger.isEnabledFor(number)
+
+    def timing(self, stage: str, elapsed_ms: int, *, queue_ms: int = 0) -> bool:
+        """慢操作默认落盘，稳定时的周期扫描只在调试级别记录。"""
+        level = (
+            "warn" if elapsed_ms + queue_ms >= 1000
+            else "debug" if stage == "source_scan"
+            else "info"
+        )
+        return self.emit(
+            level, "performance", "timing", stage=stage,
+            elapsed_ms=elapsed_ms, queue_ms=queue_ms,
+        )
 
     def emit(self, level: str, component: str, event: str, **fields: Any) -> bool:
         # 用同一把锁串行化 Logger.log/handler 调用与 configure()/close()。

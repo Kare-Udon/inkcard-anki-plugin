@@ -302,6 +302,54 @@ class SnapshotFilesHttpTests(unittest.TestCase):
             response.read()
             connection.close()
 
+    def test_commit_accepts_locally_present_descriptor_pages_and_proves_base_generation(self) -> None:
+        opened = self.open_artifacts()
+        manifest = opened["manifest"]
+        page_ids = [page["id"] for page in manifest["descriptor_pages"]]
+        file_ids = []
+        for page_index in range(len(page_ids)):
+            raw = self.store._read(lambda db: db.execute(
+                "SELECT page_json FROM artifact_descriptor_pages WHERE profile_id=? AND snapshot_id=? AND page_index=?",
+                (self.store.profile_id, manifest["snapshot_id"], page_index),
+            ).fetchone()[0])
+            file_ids.extend(item["id"] for item in json.loads(raw)["files"])
+        body = {
+            "device_id": "device-a", "session_id": "session-a",
+            "transfer_id": opened["transfer_id"], "commit_key": str(uuid.uuid4()),
+            "present_file_ids": file_ids,
+        }
+        call = lambda: self.request("POST", "/v2/artifacts/commit", body, self.headers)
+        self.assertEqual(call()[1]["error"]["code"], "artifact_manifest_pages_incomplete")
+        body["present_page_ids"] = ["f" * 64]
+        self.assertEqual(call()[1]["error"]["code"], "present_page_ids_invalid")
+        body["present_page_ids"] = page_ids
+        self.assertEqual(call()[1]["status"], "committed")
+        base = manifest["snapshot_id"]
+        self.assertEqual(self.store.active_artifact_bases(), {base})
+        prove = self.store.snapshot_has_only_own_reviews
+        self.assertTrue(prove("device-a", "session-a", base, "deck:language"))
+        self.assertFalse(prove("device-a", "session-a", base, "another-scope"))
+        legacy = self.snapshots.publish({
+            "snapshot_schema": "candidate.v1", "manifest": {}, "decks": [], "presets": [],
+            "day_table": {}, "complete": True, "unsupported": [], "cards": [{"card_id": "101"}],
+        }, scope_id="deck:language", generation=0, applied_watermark=0)
+        self.store.receive_compact_batch("device-a", "session-a", legacy.snapshot_id, 1, [[1, 3, 1_700_000_000_000, 20]])
+        self.assertEqual(self.store.pending_compact_sessions(), [("device-a", "session-a")])
+        self.assertTrue(prove("device-a", "session-a", base, "deck:language"))
+        before, after = {"revision": 0}, {"revision": 1}
+        intent = self.store.begin_compact_apply(
+            "device-a", "session-a", 1, collection_identity="collection-a", collection_generation=0,
+            policy_json={}, before_json=before,
+            plan_json={"required_evidence": ["score_applied"], "expected_score_after": after},
+            expected_after_json=after,
+        )
+        self.store.record_compact_score_evidence("device-a", "session-a", 1, stage="score_applied", evidence_json={"value": 1})
+        self.store.finish_compact_apply(intent.intent_id, after_json=after, collection_generation_after=1)
+        self.assertEqual(self.store.pending_compact_sessions(), [])
+        self.assertTrue(prove("device-a", "session-a", base, "deck:language"))
+        self.store.set_collection_generation(2)
+        self.assertFalse(prove("device-a", "session-a", base, "deck:language"))
+
     def test_received_not_applied_gate_blocks_artifact_open_and_commit(self) -> None:
         opened = self.open_artifacts()
         event = ImmutableReviewEvent.create(

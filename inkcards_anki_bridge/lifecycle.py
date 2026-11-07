@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -68,6 +69,9 @@ class LifecycleController:
         self._runtime: RuntimeLike | None = None
         self._runtime_profile: str | None = None
         self._ui_cleanup = ui_cleanup
+        self._deck_return_started: float | None = None
+        self._ankiweb_sync_started: float | None = None
+        self._media_sync_started: float | None = None
 
     @property
     def registered(self) -> bool:
@@ -107,7 +111,12 @@ class LifecycleController:
                 ("profile_will_close", self._on_profile_will_close),
             )
             optional = (("addons_dialog_will_delete_addons", self._on_addon_will_delete),
-                        ("operation_did_execute", self._on_operation_did_execute))
+                        ("operation_did_execute", self._on_operation_did_execute),
+                        ("state_will_change", self._on_state_will_change),
+                        ("deck_browser_did_render", self._on_deck_browser_did_render),
+                        ("sync_will_start", self._on_sync_will_start),
+                        ("sync_did_finish", self._on_sync_did_finish),
+                        ("media_sync_did_start_or_stop", self._on_media_sync_did_start_or_stop))
             added: list[tuple[HookLike, Callable[..., Any]]] = []
             try:
                 for name, callback in (*required, *optional):
@@ -136,6 +145,11 @@ class LifecycleController:
                 ("profile_will_close", self._on_profile_will_close),
                 ("addons_dialog_will_delete_addons", self._on_addon_will_delete),
                 ("operation_did_execute", self._on_operation_did_execute),
+                ("state_will_change", self._on_state_will_change),
+                ("deck_browser_did_render", self._on_deck_browser_did_render),
+                ("sync_will_start", self._on_sync_will_start),
+                ("sync_did_finish", self._on_sync_did_finish),
+                ("media_sync_did_start_or_stop", self._on_media_sync_did_start_or_stop),
             )
             self._registered = False
         for name, callback in callbacks:
@@ -197,6 +211,54 @@ class LifecycleController:
         except Exception as exc:
             self._report("external collection change", exc)
 
+    def _on_state_will_change(self, state: str, old_state: str) -> None:
+        with self._lock:
+            self._deck_return_started = (
+                time.monotonic() if self._runtime is not None and state == "deckBrowser"
+                and old_state in ("review", "overview") else None
+            )
+
+    def _on_deck_browser_did_render(self, _browser: Any) -> None:
+        with self._lock:
+            started, self._deck_return_started = self._deck_return_started, None
+        if started is not None and self._logging_core is not None:
+            self._logging_core.timing("deck_browser", int((time.monotonic() - started) * 1000))
+
+    def _on_sync_will_start(self) -> None:
+        with self._lock:
+            runtime = self._runtime
+            active = getattr(runtime, "ankiweb_sync_active", None)
+            if runtime is not None:
+                self._ankiweb_sync_started = time.monotonic()
+            if active is not None:
+                active.set()
+        recheck = getattr(runtime, "recheck_collection_source", None)
+        if active is not None and callable(recheck):
+            recheck()
+
+    def _on_sync_did_finish(self) -> None:
+        with self._lock:
+            runtime = self._runtime
+            started, self._ankiweb_sync_started = self._ankiweb_sync_started, None
+        if started is not None and self._logging_core is not None:
+            self._logging_core.timing("ankiweb_collection_sync", int((time.monotonic() - started) * 1000))
+        recheck = getattr(runtime, "recheck_collection_source", None)
+        if callable(recheck):
+            recheck()
+        active = getattr(runtime, "ankiweb_sync_active", None)
+        if active is not None:
+            active.clear()
+
+    def _on_media_sync_did_start_or_stop(self, active: bool) -> None:
+        with self._lock:
+            if active:
+                if self._runtime is not None and self._media_sync_started is None:
+                    self._media_sync_started = time.monotonic()
+                return
+            started, self._media_sync_started = self._media_sync_started, None
+        if started is not None and self._logging_core is not None:
+            self._logging_core.timing("ankiweb_media_sync", int((time.monotonic() - started) * 1000))
+
     def _on_addon_will_delete(self, _dialog: Any, ids: Sequence[str]) -> None:
         try:
             addon_id = self._addon_id_provider()
@@ -257,6 +319,9 @@ class LifecycleController:
         runtime = self._runtime
         self._runtime = None
         self._runtime_profile = None
+        self._deck_return_started = None
+        self._ankiweb_sync_started = None
+        self._media_sync_started = None
         return runtime
 
     @staticmethod

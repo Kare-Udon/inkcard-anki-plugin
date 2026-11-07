@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from unittest.mock import patch
 
 from inkcards_anki_bridge.anki.operations import (
     AnkiCollectionOpHost,
@@ -78,6 +79,20 @@ class OperationTests(unittest.TestCase):
         self.host = FakeHost()
         self.source = ContextSource()
         self.expected = self.source.current
+
+    def test_query_timing_separates_queue_and_execution(self):
+        created, timings = [], []
+
+        def factory(**kwargs):
+            query = FakeCollectionOp(kwargs["parent"], kwargs["op"])
+            created.append(query)
+            return query
+
+        host = AnkiQueryOpHost(factory, object(), timing=lambda *parts: timings.append(parts))
+        with patch("inkcards_anki_bridge.anki.operations.time.monotonic", side_effect=[2, 5, 7]):
+            host.submit_query(lambda collection: collection)
+            self.assertEqual(created[0].op("collection"), "collection")
+        self.assertEqual(timings, [(3000, 2000)])
 
     def test_queryop_delayed_start_failure_finishes_task_without_escaping_qt(self):
         scheduled = []

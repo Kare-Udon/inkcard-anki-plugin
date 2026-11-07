@@ -61,6 +61,52 @@ def snapshot(day: int) -> TypedSnapshot:
 
 
 class PullRefreshRuntimeTests(unittest.TestCase):
+    def test_card_changes_can_proceed_during_encoding_and_prevent_stale_commit(self):
+        with tempfile.TemporaryDirectory() as temp, patch(
+            "inkcards_anki_bridge.runtime.DeviceServer", FakeServer
+        ):
+            runtime = AddonRuntime(profile_id="profile-a", root=Path(temp), port=0).start()
+            entered, release, change_completed = (threading.Event() for _ in range(3))
+            errors = []
+            context = runtime.snapshot_context()
+            service = runtime.snapshots
+            prepare = service.prepare_publication
+
+            def slow_encode(*args, **kwargs):
+                entered.set()
+                release.wait(2)
+                return prepare(*args, **kwargs)
+
+            def publish():
+                try:
+                    runtime.publish_snapshot(snapshot(42), scope_id="scope", expected_context=context)
+                except RuntimeError as error:
+                    errors.append(str(error))
+
+            def change():
+                runtime.note_external_collection_change()
+                change_completed.set()
+
+            publisher = threading.Thread(target=publish)
+            editor = threading.Thread(target=change)
+            try:
+                with patch.object(service, "prepare_publication", side_effect=slow_encode):
+                    publisher.start()
+                    self.assertTrue(entered.wait(1))
+                    editor.start()
+                    self.assertTrue(change_completed.wait(1))
+                    release.set()
+                    publisher.join(2)
+                self.assertEqual(errors, ["snapshot context changed before publication"])
+                self.assertEqual(runtime.status()["snapshot"]["count"], 0)
+            finally:
+                release.set()
+                if publisher.ident is not None:
+                    publisher.join(2)
+                if editor.ident is not None:
+                    editor.join(2)
+                runtime.stop()
+
     def test_bound_progress_poll_returns_pending_while_publication_holds_runtime_lock(self):
         with tempfile.TemporaryDirectory() as temp, patch(
             "inkcards_anki_bridge.runtime.DeviceServer", FakeServer

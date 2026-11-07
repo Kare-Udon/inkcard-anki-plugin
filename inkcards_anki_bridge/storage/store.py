@@ -847,7 +847,10 @@ class ProfileStore(DeviceManagementStore):
             ),
         )
 
-    def save_snapshot(
+    def save_snapshot(self, **kwargs: Any) -> SnapshotRecord:
+        return self.prepare_snapshot_save(**kwargs)()
+
+    def prepare_snapshot_save(
         self,
         *,
         snapshot_id: str,
@@ -866,8 +869,8 @@ class ProfileStore(DeviceManagementStore):
         pages: Sequence[Tuple[int, str, str, int, Optional[str], bool]],
         application_context_json: Optional[str] = None,
         now_ms: Optional[int] = None,
-    ) -> SnapshotRecord:
-        """在单事务中发布不可变 payload、manifest 和预编码页。"""
+    ) -> Callable[[], SnapshotRecord]:
+        """先校验数据，返回写入不可变快照的单事务闭包。"""
 
         snapshot_id = _validate_text(snapshot_id, "snapshot_id", 256)
         scope_id = _validate_text(scope_id, "scope_id", 128)
@@ -969,82 +972,85 @@ class ProfileStore(DeviceManagementStore):
         now = _now_ms() if now_ms is None else now_ms
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise StorageValidationError("invalid timestamp", "invalid_timestamp")
-        with self._transaction() as db:
-            existing = db.execute(
-                "SELECT * FROM snapshots WHERE profile_id=? AND snapshot_id=?",
-                (self._profile_id, snapshot_id),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    str(existing["payload_json"]) != payload_json
-                    or str(existing["checksum"]) != checksum
-                    or str(existing["scope_id"]) != scope_id
-                    or int(existing["snapshot_generation"]) != generation
-                ):
-                    raise StorageValidationError(
-                        "snapshot id already contains different content",
-                        "snapshot_immutable_conflict",
-                    )
-                if existing["application_context_json"] != application_context_json:
-                    raise StorageValidationError(
-                        "snapshot id already contains different application context",
-                        "snapshot_context_conflict",
-                    )
-                return self._snapshot_record(existing)
-            # A new scope/generation snapshot invalidates every in-flight permit for
-            # that scope. The immutable snapshot rows and their pages remain auditable.
-            db.execute(
-                "UPDATE permits SET status='revoked' WHERE profile_id=? AND scope_id=? AND status='issued'",
-                (self._profile_id, scope_id),
-            )
-            db.execute(
-                "INSERT INTO snapshots(profile_id,snapshot_id,scope_generation,applied_watermark,"
-                "payload_json,checksum,created_at_ms,scope_id,snapshot_generation,manifest_json,"
-                "card_count,included_card_count,skipped_count,payload_bytes,page_count,peak_bytes_estimate,"
-                "application_context_json) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    self._profile_id,
-                    snapshot_id,
-                    generation,
-                    applied_watermark,
-                    payload_json,
-                    checksum,
-                    now,
-                    scope_id,
-                    generation,
-                    manifest_json,
-                    card_count,
-                    included_card_count,
-                    skipped_count,
-                    payload_bytes,
-                    page_count,
-                    peak_bytes_estimate,
-                    application_context_json,
-                ),
-            )
-            for page_index, page_json, page_hash, page_bytes, cursor, is_last in normalized_pages:
+        def commit() -> SnapshotRecord:
+            with self._transaction() as db:
+                existing = db.execute(
+                    "SELECT * FROM snapshots WHERE profile_id=? AND snapshot_id=?",
+                    (self._profile_id, snapshot_id),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        str(existing["payload_json"]) != payload_json
+                        or str(existing["checksum"]) != checksum
+                        or str(existing["scope_id"]) != scope_id
+                        or int(existing["snapshot_generation"]) != generation
+                    ):
+                        raise StorageValidationError(
+                            "snapshot id already contains different content",
+                            "snapshot_immutable_conflict",
+                        )
+                    if existing["application_context_json"] != application_context_json:
+                        raise StorageValidationError(
+                            "snapshot id already contains different application context",
+                            "snapshot_context_conflict",
+                        )
+                    return self._snapshot_record(existing)
+                # A new scope/generation snapshot invalidates every in-flight permit for
+                # that scope. The immutable snapshot rows and their pages remain auditable.
                 db.execute(
-                    "INSERT INTO snapshot_pages(profile_id,snapshot_id,page_index,page_json,page_hash,"
-                    "page_bytes,cursor,is_last) VALUES(?,?,?,?,?,?,?,?)",
+                    "UPDATE permits SET status='revoked' WHERE profile_id=? AND scope_id=? AND status='issued'",
+                    (self._profile_id, scope_id),
+                )
+                db.execute(
+                    "INSERT INTO snapshots(profile_id,snapshot_id,scope_generation,applied_watermark,"
+                    "payload_json,checksum,created_at_ms,scope_id,snapshot_generation,manifest_json,"
+                    "card_count,included_card_count,skipped_count,payload_bytes,page_count,peak_bytes_estimate,"
+                    "application_context_json) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         self._profile_id,
                         snapshot_id,
-                        page_index,
-                        page_json,
-                        page_hash,
-                        page_bytes,
-                        cursor,
-                        is_last,
+                        generation,
+                        applied_watermark,
+                        payload_json,
+                        checksum,
+                        now,
+                        scope_id,
+                        generation,
+                        manifest_json,
+                        card_count,
+                        included_card_count,
+                        skipped_count,
+                        payload_bytes,
+                        page_count,
+                        peak_bytes_estimate,
+                        application_context_json,
                     ),
                 )
-            row = db.execute(
-                "SELECT * FROM snapshots WHERE profile_id=? AND snapshot_id=?",
-                (self._profile_id, snapshot_id),
-            ).fetchone()
-            if row is None:
-                raise SchemaError("snapshot row disappeared after insert", "snapshot_corrupt")
-            return self._snapshot_record(row)
+                for page_index, page_json, page_hash, page_bytes, cursor, is_last in normalized_pages:
+                    db.execute(
+                        "INSERT INTO snapshot_pages(profile_id,snapshot_id,page_index,page_json,page_hash,"
+                        "page_bytes,cursor,is_last) VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            self._profile_id,
+                            snapshot_id,
+                            page_index,
+                            page_json,
+                            page_hash,
+                            page_bytes,
+                            cursor,
+                            is_last,
+                        ),
+                    )
+                row = db.execute(
+                    "SELECT * FROM snapshots WHERE profile_id=? AND snapshot_id=?",
+                    (self._profile_id, snapshot_id),
+                ).fetchone()
+                if row is None:
+                    raise SchemaError("snapshot row disappeared after insert", "snapshot_corrupt")
+                return self._snapshot_record(row)
+
+        return commit
 
     def get_snapshot(
         self, snapshot_id: str, *, scope_id: Optional[str] = None
@@ -1069,6 +1075,78 @@ class ProfileStore(DeviceManagementStore):
             if row is None:
                 raise StorageValidationError("snapshot does not exist", "snapshot_not_found")
             return self._snapshot_record(row)
+
+        return self._read(read)
+
+    def snapshot_has_only_own_reviews(
+        self, device_id: str, session_id: str, snapshot_id: str, scope_id: str
+    ) -> bool:
+        """从已提交基线到当前版本，每一步都必须是本设备会话已应用的评分。"""
+        def read(db: sqlite3.Connection) -> bool:
+            row = db.execute(
+                """
+                WITH base AS (
+                    SELECT t.generation AS first, p.collection_generation AS last
+                    FROM artifact_transfers t JOIN profile_meta p USING (profile_id)
+                    WHERE t.profile_id=? AND t.device_id=? AND t.session_id=?
+                      AND t.snapshot_id=? AND t.scope_id=? AND t.status='committed'
+                    LIMIT 1
+                )
+                SELECT b.last - b.first AS steps, COUNT(a.sequence) AS edges,
+                       COUNT(DISTINCT a.collection_generation) AS generations,
+                       COUNT(CASE WHEN a.device_id=? AND a.session_id=?
+                          AND a.collection_generation_after=a.collection_generation+1
+                          AND a.receipt_hash IS NOT NULL THEN 1 END) AS own_edges
+                FROM base b LEFT JOIN compact_applications a
+                  ON a.profile_id=? AND a.status='applied'
+                  AND a.collection_generation>=b.first AND a.collection_generation<b.last
+                GROUP BY b.first,b.last
+                """,
+                (self._profile_id, device_id, session_id, snapshot_id, scope_id,
+                 device_id, session_id, self._profile_id),
+            ).fetchone()
+            return row is not None and row[0] == row[1] == row[2] == row[3]
+
+        return self._read(read)
+
+    def pending_compact_sessions(self) -> List[Tuple[str, str]]:
+        """重启后恢复已接收但尚未尝试写回的活动会话。"""
+        def read(db: sqlite3.Connection) -> List[Tuple[str, str]]:
+            rows = db.execute(
+                """
+                SELECT a.device_id, a.session_id
+                FROM compact_applications a
+                JOIN sessions s USING (profile_id,device_id,session_id)
+                JOIN devices d USING (profile_id,device_id)
+                WHERE a.profile_id=? AND s.closed_at_ms IS NULL AND d.revoked_at_ms IS NULL
+                GROUP BY a.device_id,a.session_id
+                HAVING SUM(a.status='not_applied')>0
+                   AND SUM(a.status NOT IN ('not_applied','applied') OR a.recovery_required!=0)=0
+                ORDER BY MIN(a.updated_at_ms)
+                """,
+                (self._profile_id,),
+            ).fetchall()
+            return [(str(row[0]), str(row[1])) for row in rows]
+
+        return self._read(read)
+
+    def active_artifact_bases(self) -> set[str]:
+        """保留每个活动会话最近提交的基线，即使电脑后台已准备多轮快照。"""
+        def read(db: sqlite3.Connection) -> set[str]:
+            rows = db.execute(
+                """
+                SELECT (
+                    SELECT t.snapshot_id FROM artifact_transfers t
+                    WHERE t.profile_id=s.profile_id AND t.device_id=s.device_id
+                      AND t.session_id=s.session_id AND t.status='committed'
+                    ORDER BY t.updated_at_ms DESC, t.transfer_id DESC LIMIT 1
+                ) AS snapshot_id
+                FROM sessions s JOIN devices d USING (profile_id,device_id)
+                WHERE s.profile_id=? AND s.closed_at_ms IS NULL AND d.revoked_at_ms IS NULL
+                """,
+                (self._profile_id,),
+            ).fetchall()
+            return {str(row[0]) for row in rows if row[0] is not None}
 
         return self._read(read)
 

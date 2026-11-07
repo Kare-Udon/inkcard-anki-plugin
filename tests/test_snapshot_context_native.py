@@ -5,18 +5,64 @@ import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from shutil import copyfile
+from unittest.mock import patch
 
 # Anki's bundled packages require importing Collection before other anki modules.
 import anki.collection  # type: ignore[import-not-found]  # noqa: F401
+from anki import buildinfo
 from anki.collection import Collection  # type: ignore[import-not-found]
 
 from inkcards_anki_bridge.anki.adapter_260801 import Anki260801Adapter
+from inkcards_anki_bridge.anki.compatibility import canonical_anki_version
+from inkcards_anki_bridge.anki.snapshot_jobs import SnapshotCaptureDeferred
+from inkcards_anki_bridge.plugin import _SnapshotCollectionCopy
 from inkcards_anki_bridge.adapter import AnkiAdapterError
 from inkcards_anki_bridge.services.snapshots import SnapshotService
 from inkcards_anki_bridge.storage import ProfileStore
 
 
 class NativeSnapshotContextTests(unittest.TestCase):
+    def test_isolated_copy_matches_live_export_and_preserves_live_undo(self) -> None:
+        card_ids = self._add_cards(20)
+        context = ("profile-native", 9, "epoch-native")
+        expected = self.adapter.export_snapshot_from_collection(
+            self.collection, card_ids=card_ids, context=context,
+        )
+        undo_before = self.collection.undo_status()
+        native_before = self.collection.db.all("SELECT mod,scm,usn FROM col")
+        self.assertGreater(Path(str(self.collection.path) + "-wal").stat().st_size, 32)
+        isolated = _SnapshotCollectionCopy(self.collection)
+        try:
+            with isolated.open() as copy:
+                self.assertEqual(copy.media.dir(), self.collection.media.dir())
+                actual = self.adapter.export_snapshot_from_collection(
+                    copy, card_ids=card_ids, context=context,
+                )
+            self.assertEqual(actual.to_dict(), expected.to_dict())
+            self.assertEqual(actual.application_context, expected.application_context)
+            self.assertEqual(self.collection.undo_status(), undo_before)
+            self.assertEqual(self.collection.db.all("SELECT mod,scm,usn FROM col"), native_before)
+        finally:
+            isolated.close()
+
+    def test_isolated_copy_defers_if_live_database_changes_while_copying(self) -> None:
+        self._add_cards(1)
+        isolated = _SnapshotCollectionCopy(self.collection)
+
+        def race(source, destination):
+            result = copyfile(source, destination)
+            if Path(source) == Path(self.collection.path):
+                self._add_cards(1)
+            return result
+
+        try:
+            with patch("inkcards_anki_bridge.plugin.copyfile", side_effect=race):
+                with self.assertRaises(SnapshotCaptureDeferred), isolated.open():
+                    self.fail("不能打开复制期间发生变化的数据库")
+        finally:
+            isolated.close()
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(
             prefix="inkcards-snapshot-context-", dir="/private/tmp"
@@ -71,8 +117,8 @@ class NativeSnapshotContextTests(unittest.TestCase):
                 "runtime_epoch": "epoch-native",
             },
             profile_identity="profile-native",
-            anki_version="26.09.3",
-            anki_build="29bb700b",
+            anki_version=buildinfo.version,
+            anki_build=buildinfo.buildhash,
         )
 
     def tearDown(self) -> None:
@@ -114,15 +160,16 @@ class NativeSnapshotContextTests(unittest.TestCase):
         assert context is not None
         self.assertEqual(context.profile_identity, "profile-native")
         self.assertEqual(context.collection_generation, 9)
-        self.assertEqual(context.anki_version, "26.9.3")
-        self.assertEqual(context.anki_build, "29bb700b")
+        version = canonical_anki_version(buildinfo.version)
+        self.assertEqual(context.anki_version, version)
+        self.assertEqual(context.anki_build, buildinfo.buildhash)
         self.assertIs(context.fsrs_enabled, True)
         self.assertIn("1", context.preset_configs)
         self.assertIn(str(typed.decks[0].preset_id), context.preset_configs)
         self.assertEqual(context.preset_configs["1"]["fsrsParams6"], ())
         self.assertEqual(
             context.preset_parameter_identities["1"],
-            "anki-native-default:26.9.3:29bb700b",
+            f"anki-native-default:{version}:{buildinfo.buildhash}",
         )
         self.assertEqual(context.preset_configs["1"]["maxTaken"], 60)
         self.assertIn("Collection.decks.config_dict_for_deck_id", context.source_summary.values())

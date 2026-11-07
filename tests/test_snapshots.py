@@ -8,6 +8,7 @@ import unittest
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from inkcards_anki_bridge.anki.models import (
     CardSnapshot,
@@ -618,6 +619,21 @@ class SnapshotServiceTests(unittest.TestCase):
                 applied_watermark=0,
             )
         self.assertEqual(raised.exception.code, "snapshot_unpageable")
+
+    def test_pagination_only_encodes_each_nonempty_page_once(self) -> None:
+        base = make_snapshot(question='多字节和"转义"\n测试')
+        cards = tuple(replace(base.cards[0], card_id=str(index)) for index in range(1, 25))
+        snapshot = replace(base, cards=cards, manifest=replace(
+            base.manifest, card_count=len(cards), included_card_count=len(cards),
+            scope_card_ids=tuple(card.card_id for card in cards),
+        ))
+        service = SnapshotService(self.store, page_bytes=1700)
+        with patch.object(service, "_page_wire", wraps=service._page_wire) as encode:
+            published = service.publish(snapshot, scope_id="deck:language")
+        pages = [call.kwargs["cards"] for call in encode.call_args_list if call.kwargs["cards"]]
+        self.assertEqual(len(pages), published.manifest["page_count"])
+        self.assertEqual([item["card_id"] for page in pages for item in page],
+                         [card.card_id for card in cards])
 
     def test_nonce_page_idempotency_commit_and_restart(self) -> None:
         service = SnapshotService(self.store, page_bytes=1200)

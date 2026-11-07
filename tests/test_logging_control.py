@@ -13,6 +13,19 @@ from inkcards_anki_bridge.logging_control import AddonLogger, DEFAULT_LOGGING_PO
 
 
 class AddonLoggerTests(unittest.TestCase):
+    def test_slow_query_timing_includes_queue_time_without_debug_logging(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            logger = AddonLogger(root)
+            self.assertFalse(logger.timing("source_scan", 50, queue_ms=10))
+            self.assertTrue(logger.timing("source_scan", 50, queue_ms=2500))
+            row, = self.read_rows(root)
+            self.assertEqual(
+                (row["component"], row["stage"], row["elapsed_ms"], row["queue_ms"]),
+                ("performance", "source_scan", 50, 2500),
+            )
+            logger.close()
+
     def read_rows(self, root: Path) -> list[dict]:
         rows = []
         for name in ("plugin.jsonl", "plugin.jsonl.1"):

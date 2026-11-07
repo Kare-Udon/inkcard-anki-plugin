@@ -6,8 +6,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from inkcards_anki_bridge.anki.operations import OperationResult, OperationState
-from inkcards_anki_bridge.anki.preparation import PreparedSync
+
+from inkcards_anki_bridge.anki.operations import (
+    OperationResult,
+    OperationState,
+    QueryOpAdapter,
+)
+from inkcards_anki_bridge.anki.preparation import (
+    PreparedSync,
+    SourceSignature,
+    media_signature,
+)
 from inkcards_anki_bridge.anki.snapshot_jobs import SnapshotJobState
 from inkcards_anki_bridge.runtime import AddonRuntime
 from inkcards_anki_bridge.services.snapshot_files import ArtifactError
@@ -93,6 +102,28 @@ def args(runtime):
     }
 
 
+def test_pull_decision_checks_media_and_scope_without_waiting_for_pack(scene, tmp_path):
+    runtime, scanner, prepare, jobs = scene
+    media = tmp_path / "media"
+    media.mkdir()
+    signature = SourceSignature("source", str(media), media_signature(media), 2**31)
+    prepare.tick()
+    scanner.finish(signature)
+    complete(runtime, prepare, jobs[-1])
+    base = jobs[-1].result.snapshot_id
+    with patch.object(
+        runtime.store, "snapshot_has_only_own_reviews", return_value=True
+    ) as proof:
+        prepare.invalidate()
+        assert prepare.can_skip_pull("device-a", "session-a", base)
+        proof.assert_called_once_with(
+            "device-a", "session-a", base, runtime.default_sync_scope_id()
+        )
+        assert not prepare.can_skip_pull("device-a", "session-a", "unknown-base")
+        (media / "added.png").write_bytes(b"media")
+        assert not prepare.can_skip_pull("device-a", "session-a", base)
+
+
 def test_background_prepares_without_device_and_sync_never_builds(scene):
     runtime, scanner, prepare, jobs = scene
     prepare.tick()
@@ -123,6 +154,108 @@ def test_background_prepares_without_device_and_sync_never_builds(scene):
             refresh_token=body["refresh_token"],
         )
     assert error.value.code == "snapshot_refresh_token_invalid"
+
+
+def test_stale_publication_is_retried_without_marking_refresh_failed(scene):
+    runtime, scanner, prepare, jobs = scene
+    prepare.tick()
+    scanner.finish("before")
+    jobs[-1].state = SnapshotJobState.STALE_RESULT_DROPPED
+    prepare.tick()
+    assert runtime.refresh_pull(**args(runtime))[0] == 202
+    prepare.tick()
+    scanner.finish("after")
+    assert len(jobs) == 2
+
+
+def test_on_demand_does_not_touch_collection_until_requested_and_idle(scene):
+    runtime, scanner, prepare, jobs = scene
+    prepare._on_demand = True
+    busy = True
+    prepare._host_available = lambda: not busy
+    prepare.invalidate()
+    prepare.tick()
+    assert not hasattr(scanner, "complete")
+    status, body = runtime.refresh_pull(**args(runtime))
+    assert status == 202 and body["state"] == "pending"
+    prepare.tick()
+    assert not hasattr(scanner, "complete")
+    busy = False
+    prepare.tick()
+    scanner.finish("after")
+    assert len(jobs) == 1
+    complete(runtime, prepare, jobs[-1])
+    assert runtime.refresh_pull(**args(runtime), refresh_token=body["refresh_token"])[0] == 200
+    prepare.invalidate()
+    prepare.tick()
+    assert len(jobs) == 1
+
+
+@pytest.mark.parametrize("writeback_timing", ["before_scan", "during_scan"])
+def test_rating_writeback_keeps_refresh_pending_until_new_snapshot(
+    scene, writeback_timing
+):
+    runtime, _, prepare, jobs = scene
+    queued = []
+    prepare.operations = QueryOpAdapter(
+        submitter=queued.append, context_provider=runtime.snapshot_context
+    )
+    prepare.clock = lambda: 100
+
+    def commit_rating_writeback():
+        runtime.store.set_collection_generation(1)
+        runtime.refresh_committed_collection_generation(1)
+
+    def scan(*_):
+        if writeback_timing == "during_scan" and runtime.collection_generation == 0:
+            commit_rating_writeback()
+        return "signature"
+
+    with patch("inkcards_anki_bridge.anki.preparation.source_signature", scan):
+        prepare.tick()
+        status, pending = runtime.refresh_pull(**args(runtime))
+        assert (status, pending["state"]) == (202, "pending")
+        refresh = {**args(runtime), "refresh_token": pending["refresh_token"]}
+        if writeback_timing == "before_scan":
+            commit_rating_writeback()
+        discarded = queued.pop(0)(object())
+        assert discarded.state is OperationState.STALE_RESULT_DROPPED
+        assert discarded.executed is (writeback_timing == "during_scan")
+        assert not jobs
+        status, pending = runtime.refresh_pull(**refresh)
+        assert (status, pending["state"]) == (202, "pending")
+
+        # 计时不前进，下一轮仍应立即扫描新版本。
+        prepare.tick()
+        assert queued.pop(0)(object()).state is OperationState.COMPLETED
+
+    assert len(jobs) == 1
+    complete(runtime, prepare, jobs[0])
+    status, ready = runtime.refresh_pull(**refresh)
+    assert (status, ready["state"], ready["snapshot_generation"]) == (200, "ready", 1)
+
+
+@pytest.mark.parametrize("writeback_during_failure", [False, True])
+def test_source_scan_exception_still_fails_refresh(scene, writeback_during_failure):
+    runtime, _, prepare, _ = scene
+    queued = []
+    prepare.operations = QueryOpAdapter(
+        submitter=queued.append, context_provider=runtime.snapshot_context
+    )
+
+    def broken_scan(*_):
+        if writeback_during_failure:
+            runtime.store.set_collection_generation(1)
+            runtime.refresh_committed_collection_generation(1)
+        raise RuntimeError("source read failed")
+
+    with patch("inkcards_anki_bridge.anki.preparation.source_signature", broken_scan):
+        prepare.tick()
+        assert isinstance(queued.pop(0)(object()).error, RuntimeError)
+
+    with pytest.raises(SnapshotError) as error:
+        runtime.refresh_pull(**args(runtime))
+    assert (error.value.status, error.value.code) == (409, "snapshot_prepare_failed")
 
 
 def test_restart_validates_and_reuses_prepared_version(scene):

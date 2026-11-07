@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+from shutil import copyfile
+from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional, Tuple
 
@@ -17,7 +21,7 @@ from .anki.operations import (
     CollectionStartRejected,
     QueryOpAdapter,
 )
-from .anki.snapshot_jobs import SnapshotJobManager
+from .anki.snapshot_jobs import SnapshotCaptureDeferred, SnapshotJobManager
 from .lifecycle import LifecycleController
 from .logging_control import AddonLogger, logging_policy_from_config, normalize_logging_policy
 from .profile_identity import load_or_create_profile_identity, profile_namespace
@@ -30,6 +34,66 @@ from .runtime import (
 )
 
 _CONTROLLER_ATTR = "_inkcards_anki_bridge_lifecycle"
+
+
+def _collection_available(main_window: Any, runtime: AddonRuntime) -> bool:
+    return getattr(main_window, "state", None) == "deckBrowser" and not runtime.ankiweb_sync_active.is_set()
+
+
+class _SnapshotCollectionCopy:
+    """把同一版本的数据库和 WAL 拷到工作线程，SQLite 在副本中恢复。"""
+
+    def __init__(self, collection: Any, timing=None) -> None:
+        self._source = Path(collection.path)
+        self._media_dir = collection.media.dir()
+        self._timing = timing
+        self._files = tuple(Path(str(self._source) + suffix) for suffix in ("", "-wal", "-journal"))
+        self._captured = self._stamp()
+        self._directory = None
+
+    def _stamp(self):
+        stamps = []
+        for path in self._files:
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                stamps.append(None)
+                continue
+            stamps.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        return tuple(stamps)
+
+    @contextmanager
+    def open(self):
+        from anki.collection import Collection
+
+        started = monotonic()
+        if self._captured[0] is None or self._captured[2] is not None or self._stamp() != self._captured:
+            raise SnapshotCaptureDeferred()
+        self._directory = TemporaryDirectory(prefix="inkcards-export-", ignore_cleanup_errors=True)
+        root = Path(self._directory.name)
+        try:
+            for path, stamp in zip(self._files, self._captured):
+                if stamp is not None:
+                    copyfile(path, root / path.name)
+        except FileNotFoundError as error:
+            raise SnapshotCaptureDeferred() from error
+        if self._stamp() != self._captured:
+            raise SnapshotCaptureDeferred()
+        copy = Collection(str(root / self._source.name))
+        try:
+            if copy.db.all("PRAGMA quick_check") != [["ok"]]:
+                raise SnapshotCaptureDeferred()
+            # 临时库有独立媒体数据库。渲染引用的文件沿用已绑定的源媒体目录。
+            copy.media.dir = lambda: self._media_dir
+            yield copy
+        finally:
+            copy.close()
+            if self._timing is not None:
+                self._timing("snapshot_export", int((monotonic() - started) * 1000))
+
+    def close(self) -> None:
+        if self._directory is not None:
+            self._directory.cleanup()
 
 
 def _profile_folder(main_window: Any) -> Path:
@@ -374,7 +438,7 @@ def _attach_compact_jobs(
     def reviewer_available() -> bool:
         # Anki 的主窗口状态是轻量字符串；未知状态按失败关闭处理。
         state = getattr(main_window, "state", None)
-        return isinstance(state, str) and state != "review"
+        return state in ("deckBrowser", "overview") and not runtime.ankiweb_sync_active.is_set()
 
     def apply_one(collection: Any, device_id: str, session_id: str, context: Any) -> Any:
         diagnostics.begin()
@@ -441,6 +505,7 @@ def _attach_compact_jobs(
         update_collection_generation=runtime.refresh_committed_collection_generation,
         reviewer_available=reviewer_available,
         diagnostics=diagnostics,
+        defer_when_busy=True,
     )
     return runtime.attach_compact_jobs(manager)
 
@@ -467,6 +532,9 @@ def _attach_snapshot_jobs(
         factory,
         main_window,
         schedule_on_main=schedule_on_main,
+        timing=lambda queue, elapsed: runtime.logging_core.timing(
+            "snapshot_capture", elapsed, queue_ms=queue
+        ),
     )
     operation_adapter = QueryOpAdapter(
         host=host,
@@ -483,11 +551,18 @@ def _attach_snapshot_jobs(
         generation_provider=lambda: runtime.collection_generation,
         runtime_epoch_provider=lambda: runtime.runtime_epoch,
     )
+    def capture(collection):
+        if not _collection_available(main_window, runtime):
+            raise SnapshotCaptureDeferred()
+        return _SnapshotCollectionCopy(collection, runtime.logging_core.timing)
+
     manager = SnapshotJobManager(
         operation_adapter=operation_adapter,
         exporter=exporter,
         context_provider=runtime.snapshot_context,
         publish=runtime.publish_snapshot,
+        background_publish=True,
+        capture_collection=capture,
     )
     return runtime.attach_snapshot_jobs(manager)
 
@@ -613,6 +688,7 @@ def start_in_anki(
             runtime=runtime,
         )
         _attach_preparation(aqt_module=aqt_module, main_window=main_window, runtime=runtime)
+        runtime.resume_received_reviews()
     except Exception:
         runtime.stop()
         raise
@@ -626,19 +702,33 @@ def _attach_preparation(*, aqt_module, main_window, runtime):
     if runtime.snapshot_jobs is None or not callable(getattr(getattr(main_window, "taskman", None), "run_on_main", None)):
         return
     factory = _query_op_factory(aqt_module)
-    host = AnkiQueryOpHost(factory, main_window,
-        schedule_on_main=getattr(getattr(main_window, "taskman", None), "run_on_main", None))
+    host = AnkiQueryOpHost(
+        factory, main_window,
+        schedule_on_main=getattr(getattr(main_window, "taskman", None), "run_on_main", None),
+        timing=lambda queue, elapsed: runtime.logging_core.timing(
+            "source_scan", elapsed, queue_ms=queue
+        ),
+    )
     operations = QueryOpAdapter(host=host, context_provider=runtime.snapshot_context)
     from aqt.qt import QObject, QTimer
     if not isinstance(main_window, QObject):
         return  # 无 Qt 对象的单元测试宿主不启动界面计时器。
     from .anki.preparation import PreparedSync
-    preparation = PreparedSync(runtime, operations)
+    def available() -> bool:
+        return _collection_available(main_window, runtime)
+
+    preparation = PreparedSync(runtime, operations, on_demand=True, host_available=available)
     runtime._preparation = preparation
     runtime.router.snapshot_files_service.require_prepared = True
     timer = QTimer(main_window)
     timer.setInterval(500)
-    timer.timeout.connect(preparation.tick)
+    def tick() -> None:
+        compact = runtime.compact_jobs
+        if compact is not None:
+            compact.resume_queued()
+        preparation.tick()
+
+    timer.timeout.connect(tick)
     preparation._timer = timer
     timer.start()
 

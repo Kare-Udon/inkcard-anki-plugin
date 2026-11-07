@@ -4,13 +4,13 @@
 
 Sync text and image cards and review records between Anki Desktop and [Xteink X4](https://www.xteink.cn/) devices.
 
-Current version: `0.2.0-preview.20`, paired with **InkCards device `0.2.77` (API 2.6, source baseline 0.2.76 / r8.3)**. The add-on and device use separate version numbers.
+Current version: `0.2.0-preview.26`, paired with **InkCards device `0.2.86` (API 2.18)**. The add-on and device use separate version numbers.
 
 The bundled image converter targets macOS Apple Silicon / CPython 3.13. Image support on Windows, Linux, Intel Mac, or another Python ABI is unverified.
 
-This is a pre-release. The device-side `descriptor json_encode` sync failure remains under investigation; 0.2.76 adds diagnostics and does not claim to fix it. API 0.8 device data and pending reviews are not migrated automatically to the new file storage. Upload pending reviews and verify migration before upgrading.
+This is a pre-release. API 0.8 device data and pending reviews are not migrated automatically to the new file storage. Upload pending reviews and verify migration before upgrading.
 
-Supported Anki versions: `26.08.1` and `26.9.3`.
+Supported Anki versions: `26.08.1`, `26.09.3`, and `26.09.4`.
 
 ## Installation
 
@@ -27,7 +27,7 @@ All decks participate by default, including newly created decks. Check the **Exc
 
 Changes are saved automatically and take effect on the next sync. An active sync keeps its original scope. Failed saves restore the previous setting; damaged policy files block sync. Search and **Excluded only** change the view, not the sync scope. Parent card counts include descendants and must not be added to child counts.
 
-The add-on confirms outstanding reviews before preparing the current scope and transferring changed files. Excluding a deck removes only the device copy after a successful sync; Anki cards remain intact. Failure or cancellation preserves the previous device library. Excluding every deck produces an empty device library. Capacity and unsupported-content errors require a clear corrective action rather than silently reporting a partial library as complete.
+The add-on saves incoming ratings before applying them when Anki is idle. If the desktop library has no other changes, the device can finish after receiving the ratings receipt. When the library changes, the add-on prepares a snapshot on demand and transfers only changed files. Excluding a deck removes only the device copy after a successful sync; Anki cards remain intact. Failure or cancellation preserves the previous device library. Excluding every deck produces an empty device library. Capacity and unsupported-content errors require a clear corrective action rather than silently reporting a partial library as complete.
 
 Device management is available from the header. LAN access, logging, and recovery are in **Settings**. Manual preflight, snapshot preparation, and package generation are no longer part of normal use.
 
@@ -75,7 +75,7 @@ Build the package from the source root:
 python3 tools/package_ankiaddon.py
 ```
 
-Output: `dist/InkCards-Anki-Bridge-0.2.0-preview.20.ankiaddon`. Install it in Anki, restart, and open the target profile. Launch the interface through **Tools → InkCards…**. After editing the source, rebuild, reinstall, and restart Anki.
+Output: `dist/InkCards-Anki-Bridge-0.2.0-preview.26.ankiaddon`. Install it in Anki, restart, and open the target profile. Launch the interface through **Tools → InkCards…**. After editing the source, rebuild, reinstall, and restart Anki.
 
 Run packaging, pairing authentication, storage, and add-on UI tests:
 

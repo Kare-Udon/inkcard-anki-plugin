@@ -88,6 +88,7 @@ class AddonRuntime:
         self._server_limits = server_limits
         self._logging_core = logging_core or AddonLogger(self._root, policy=DEFAULT_LOGGING_POLICY)
         self._lock = threading.RLock()
+        self.ankiweb_sync_active = threading.Event()
         self._state = "stopped"
         self._accepting = False
         self._runtime_epoch: Optional[str] = None
@@ -257,6 +258,7 @@ class AddonRuntime:
                     compact_job_requester=self.request_compact_apply,
                     compact_job_status_reader=self.compact_apply_status,
                     compact_capability_reader=self.compact_capabilities,
+                    skip_pull_reader=self.can_skip_pull,
                     limits=self._route_limits,
                     logger=self._logging_core,
                 )
@@ -426,18 +428,26 @@ class AddonRuntime:
                 raise RuntimeError("addon runtime is not running")
             service = self._snapshots
             assert service is not None
-            if expected_context is not None:
-                expected = OperationContext.from_value(expected_context)
-                current = self.snapshot_context()
-                if current != expected:
-                    raise RuntimeError("snapshot context changed before publication")
+            current = self.snapshot_context()
+            expected = OperationContext.from_value(expected_context) if expected_context is not None else current
+            if current != expected:
+                raise RuntimeError("snapshot context changed before publication")
             if "generation" not in kwargs and self._collection_generation is not None:
                 kwargs["generation"] = self._collection_generation
-            # 保持 runtime lock 直到 SnapshotService 完成事务，使 generation
-            # 更新和 expected-context 校验之间没有可发布的竞态窗口。
-            result = service.publish(snapshot, scope_id=scope_id, **kwargs)
+
+        started = time.monotonic()
+        commit = service.prepare_publication(snapshot, scope_id=scope_id, **kwargs)
+        self._logging_core.timing("snapshot_encode", int((time.monotonic() - started) * 1000))
+
+        with self._lock:
+            # 仅在持久提交时持锁，编码期间卡库仍可更新。旧导出不得提交。
+            if self._snapshots is not service or self.snapshot_context() != expected:
+                raise RuntimeError("snapshot context changed before publication")
+            started = time.monotonic()
+            result = commit()
             self._last_snapshot = result
-            return result
+        self._logging_core.timing("snapshot_commit", int((time.monotonic() - started) * 1000))
+        return result
 
     def snapshot_context(self) -> Optional[OperationContext]:
         """返回 QueryOp 作业必须绑定的 profile/generation/epoch 三元组。"""
@@ -564,6 +574,31 @@ class AddonRuntime:
             self._sync_state = {**self._sync_state, "stage": stage,
                 "state": "completed" if stage == "committed" else "failed" if stage == "failed" else "active",
                 "error": None, "updated_at_ms": int(time.time() * 1000), **details}
+
+    def can_skip_pull(self, device_id: str, session_id: str, snapshot_id: str) -> bool:
+        preparation = self._preparation
+        if preparation is None or not self.compact_capabilities()["apply_enabled"]:
+            return False
+        try:
+            return preparation.can_skip_pull(device_id, session_id, snapshot_id)
+        except Exception as error:
+            # 附加判断失败时，已持久接收的评分仍必须收到正常回执。
+            self._logging_core.log_exception("preparation", "pull_decision_failed", error, stage="pull_decision")
+            return False
+
+    def resume_received_reviews(self) -> None:
+        if not self.compact_capabilities()["apply_enabled"]:
+            return
+        try:
+            for device, session in self.store.pending_compact_sessions():
+                self.request_compact_apply(device, session)
+        except Exception as error:
+            self._logging_core.log_exception("compact", "resume_failed", error, stage="resume")
+
+    def recheck_collection_source(self) -> None:
+        preparation = self._preparation
+        if preparation is not None:
+            preparation.recheck_source()
 
     def request_snapshot(self, *, card_ids: Any = None, deck_ids: Any = None) -> SnapshotJob:
         """后续 UI/HTTP 使用的最小只读请求入口。"""
@@ -775,11 +810,13 @@ class AddonRuntime:
 
     def compact_capabilities(self) -> Dict[str, Any]:
         with self._lock:
+            native = self._compact_capability
             enabled = (self._state == "running" and self._compact_jobs is not None
-                       and self._compact_capability.get("write_enabled") is True)
+                       and native.get("write_enabled") is True)
         return {"protocol": "x4-3", "apply_enabled": enabled,
                 "states": ["New", "Learning", "Review", "Relearning"], "ratings": [1, 2, 3, 4],
-                "requires_frozen_context": True, "native_version": "26.09.3", "native_build": "29bb700b",
+                "requires_frozen_context": True, "native_version": native.get("anki_version"),
+                "native_build": native.get("anki_build"),
                 "historical_clock": "isolated-relative-transfer",
                 "cutoff_policy": "reject_unproven_learning_day_classification",
                 "offline_schedule": "prediction",

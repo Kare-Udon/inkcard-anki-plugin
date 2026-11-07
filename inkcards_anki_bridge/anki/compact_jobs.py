@@ -175,6 +175,7 @@ class CompactJobManager:
         max_active_jobs: int = 16,
         max_retained_jobs: int = 64,
         diagnostics: Any = None,
+        defer_when_busy: bool = False,
     ) -> None:
         if not isinstance(operation_adapter, CollectionOpAdapter):
             raise TypeError("operation_adapter must be a CollectionOpAdapter")
@@ -201,6 +202,7 @@ class CompactJobManager:
         self._apply_one = apply_one
         self._update_collection_generation = update_collection_generation
         self._reviewer_available = reviewer_available
+        self._defer_when_busy = defer_when_busy
         self._max_active_jobs = max_active_jobs
         self._max_retained_jobs = max_retained_jobs
         self._lock = threading.RLock()
@@ -306,12 +308,17 @@ class CompactJobManager:
         except BaseException:
             return False
 
+    def resume_queued(self) -> None:
+        self._start_next()
+
     def _start_next(self) -> None:
         while True:
             with self._lock:
                 if self._closed or self._current is not None:
                     return
                 if not self._queue:
+                    return
+                if self._defer_when_busy and not self._reviewer_gate():
                     return
                 job = self._queue.popleft()
                 if job._state in _FINAL_STATES or job._cancel_requested:
@@ -353,9 +360,10 @@ class CompactJobManager:
             return
 
         with self._lock:
-            job._operation_task = task
+            if self._current is job:
+                job._operation_task = task
             canceled = job._cancel_requested and job._state not in _FINAL_STATES
-            finalized = job._state in _FINAL_STATES
+            finalized = job._state in _FINAL_STATES or job._state is CompactJobState.QUEUED
             task_state = task.state
         if canceled:
             task.cancel()
@@ -517,6 +525,17 @@ class CompactJobManager:
 
     def _on_collection_failure(self, job: CompactJob, error: BaseException) -> None:
         code = getattr(error, "code", None)
+        if self._defer_when_busy and code == "reviewer_owns_collection":
+            with self._lock:
+                if self._current is not job:
+                    return
+                if not self._closed and not job._cancel_requested:
+                    job._state = CompactJobState.QUEUED
+                    job._operation_task = None
+                    job._operation_result = None
+                    self._current = None
+                    self._queue.appendleft(job)
+                    return
         if self._diagnostics is not None:
             self._diagnostics.record_exception(error, "collection")
         with self._lock:

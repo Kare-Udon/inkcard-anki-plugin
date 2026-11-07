@@ -463,7 +463,11 @@ class SnapshotService:
         wire = _canonical(page)
         return wire, page_hash, cursor
 
-    def publish(
+    def publish(self, snapshot: Any, **kwargs: Any) -> PublishedSnapshot:
+        """为直接调用者同步准备并提交快照。"""
+        return self.prepare_publication(snapshot, **kwargs)()
+
+    def prepare_publication(
         self,
         snapshot: Any,
         *,
@@ -474,8 +478,8 @@ class SnapshotService:
         snapshot_generation: Optional[int] = None,
         scope_generation: Optional[int] = None,
         source_scope: Optional[Mapping[str, Any]] = None,
-    ) -> PublishedSnapshot:
-        """将 typed snapshot 转成 canonical bytes、预编码页并一次事务发布。"""
+    ) -> Callable[[], PublishedSnapshot]:
+        """编码快照与分页，返回只负责持久提交的闭包。"""
 
         scope_id = _validate_text(scope_id, "scope_id", 128)
         normalized_source: Optional[Dict[str, Any]] = None
@@ -555,26 +559,35 @@ class SnapshotService:
         if len(prepared_cards) != len(cards):
             raise SnapshotError("snapshot_invalid")
 
-        # Greedy packing is deterministic. The full response envelope, including
-        # escaped UTF-8 card text and page metadata, consumes page_bytes.
+        # 每张卡只编码一次来计量。空页提供当前页的信封开销，
+        # cards 数组只额外占各卡的 UTF-8 字节和分隔逗号。
+        # page_bytes 字段的十进制位数随总长单调变化，按预算上界扣除即可判定是否装得下。
         chunks: List[List[Mapping[str, Any]]] = []
         current: List[Mapping[str, Any]] = []
+        current_bytes = 0
+        empty_page_bytes = None
+        budget_without_size = self.page_bytes - len(str(self.page_bytes))
         for card in prepared_cards:
             if len(current) >= self.max_cards_per_page:
                 chunks.append(current)
                 current = []
-            candidate = current + [card]
-            probe, _, _ = self._page_wire(
-                snapshot_id=selected_snapshot_id,
-                snapshot_hash=checksum,
-                scope_id=scope_id,
-                generation=selected_generation,
-                applied_watermark=selected_watermark,
-                page_index=len(chunks),
-                cards=candidate,
-                is_last=False,
-            )
-            if len(probe) > self.page_bytes:
+                current_bytes = 0
+                empty_page_bytes = None
+            if empty_page_bytes is None:
+                envelope, _, _ = self._page_wire(
+                    snapshot_id=selected_snapshot_id,
+                    snapshot_hash=checksum,
+                    scope_id=scope_id,
+                    generation=selected_generation,
+                    applied_watermark=selected_watermark,
+                    page_index=len(chunks),
+                    cards=[],
+                    is_last=False,
+                )
+                empty_page_bytes = len(envelope) - len(str(len(envelope)))
+            card_bytes = len(_canonical(card))
+            candidate_bytes = current_bytes + card_bytes + (1 if current else 0)
+            if empty_page_bytes + candidate_bytes > budget_without_size:
                 if not current:
                     if len(prepared_cards) == 1 and not chunks:
                         final_probe, _, _ = self._page_wire(
@@ -593,8 +606,11 @@ class SnapshotService:
                     raise SnapshotError("snapshot_unpageable", status=413)
                 chunks.append(current)
                 current = [card]
+                current_bytes = card_bytes
+                empty_page_bytes = None
             else:
-                current = candidate
+                current.append(card)
+                current_bytes = candidate_bytes
         if current or not chunks:
             chunks.append(current)
 
@@ -643,15 +659,18 @@ class SnapshotService:
         if normalized_source is not None:
             preflight["source_scope"] = normalized_source
         preflight_bytes = _canonical(preflight)
+        payload_json = payload_bytes.decode("utf-8")
+        preflight_json = preflight_bytes.decode("utf-8")
+
         try:
-            record = self.store.save_snapshot(
+            commit_record = self.store.prepare_snapshot_save(
                 snapshot_id=selected_snapshot_id,
                 scope_id=scope_id,
                 generation=selected_generation,
                 applied_watermark=selected_watermark,
-                payload_json=payload_bytes.decode("utf-8"),
+                payload_json=payload_json,
                 checksum=checksum,
-                manifest_json=preflight_bytes.decode("utf-8"),
+                manifest_json=preflight_json,
                 card_count=card_count,
                 included_card_count=included_card_count,
                 skipped_count=skipped_count,
@@ -664,15 +683,23 @@ class SnapshotService:
             )
         except StorageValidationError as error:
             raise self._storage_error(error) from None
-        return PublishedSnapshot(
-            snapshot_id=record.snapshot_id,
-            scope_id=record.scope_id,
-            snapshot_generation=record.snapshot_generation,
-            applied_watermark=record.applied_watermark,
-            checksum=record.checksum,
-            manifest=_decode_object(record.manifest_json),
-            payload_bytes=record.payload_json.encode("utf-8"),
-        )
+
+        def commit() -> PublishedSnapshot:
+            try:
+                record = commit_record()
+            except StorageValidationError as error:
+                raise self._storage_error(error) from None
+            return PublishedSnapshot(
+                snapshot_id=record.snapshot_id,
+                scope_id=record.scope_id,
+                snapshot_generation=record.snapshot_generation,
+                applied_watermark=record.applied_watermark,
+                checksum=record.checksum,
+                manifest=_decode_object(record.manifest_json),
+                payload_bytes=record.payload_json.encode("utf-8"),
+            )
+
+        return commit
 
     @staticmethod
     def _validated_source_scope(source: Any, scope_id: str) -> Dict[str, Any]:

@@ -29,7 +29,7 @@ class PackageAnkiaddonTests(unittest.TestCase):
         return package_ankiaddon.write_package(root, output)
 
     def test_version_fields_and_archive_name_are_aligned(self) -> None:
-        expected_version = "0.2.0-preview.20"
+        expected_version = "0.2.0-preview.26"
         manifest = json.loads((SOURCE_ROOT / "manifest.json").read_text(encoding="utf-8"))
         from inkcards_anki_bridge import __version__
 
@@ -38,7 +38,7 @@ class PackageAnkiaddonTests(unittest.TestCase):
         self.assertEqual(package_ankiaddon.HUMAN_VERSION, expected_version)
         self.assertEqual(
             package_ankiaddon.ARCHIVE_FILENAME,
-            "InkCards-Anki-Bridge-0.2.0-preview.20.ankiaddon",
+            "InkCards-Anki-Bridge-0.2.0-preview.26.ankiaddon",
         )
 
     def test_real_build_contains_only_the_explicit_production_allowlist(self) -> None:
@@ -210,7 +210,7 @@ class BlockLegacyImports:
 sys.meta_path.insert(0, BlockLegacyImports())
 import inkcards_anki_bridge
 
-assert inkcards_anki_bridge.__version__ == "0.2.0-preview.20"
+assert inkcards_anki_bridge.__version__ == "0.2.0-preview.26"
 assert not any(
     name == "aqt" or name.startswith("aqt.")
     or name in {
@@ -234,7 +234,7 @@ print(inkcards_anki_bridge.__version__)
             capture_output=True,
             text=True,
         )
-        self.assertEqual(result.stdout.strip(), "0.2.0-preview.20")
+        self.assertEqual(result.stdout.strip(), "0.2.0-preview.26")
 
 
 if __name__ == "__main__":

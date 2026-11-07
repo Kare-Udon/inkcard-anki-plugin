@@ -28,11 +28,10 @@ from .adopted_restore import (
     verify_adopted_prestate,
 )
 from .application_context import SnapshotApplicationContext
+from .compatibility import supports_compact_anki_build
 from .compact_projection import (
     MAX_ANSWERED_AT_MS,
     MAX_DURATION_MS,
-    PINNED_ANKI_BUILD,
-    PINNED_ANKI_VERSION_CANONICAL,
     CompactApplyAuthorization,
     CompactProjectionError,
     build_marker_custom_data,
@@ -370,11 +369,9 @@ def _snapshot_application_context(
         or context.snapshot_generation != payload_generation
         or source.profile_identity != manifest_identity
         or source.runtime_epoch != manifest.get("runtime_epoch")
-        or source_version is None
         or source_version != manifest_version
-        or source_version != PINNED_ANKI_VERSION_CANONICAL
         or source.anki_build.lower() != str(manifest.get("anki_build", "")).lower()
-        or source.anki_build.lower() != PINNED_ANKI_BUILD
+        or not supports_compact_anki_build(source_version, source.anki_build.lower())
     ):
         raise CompactNativeError("snapshot_application_context_binding_mismatch", "旁路评分上下文与快照 producer 身份不符")
     return context
@@ -392,8 +389,8 @@ def _profile_binding(manifest: Mapping[str, Any], collection_identity: str) -> N
         raise CompactNativeError("collection_identity_mismatch", "snapshot and collection identities differ")
     version = _canonical_version(manifest.get("anki_version"))
     build = str(manifest.get("anki_build", "")).lower()
-    if version != PINNED_ANKI_VERSION_CANONICAL or build != PINNED_ANKI_BUILD:
-        raise CompactNativeError("snapshot_anki_build_mismatch", "snapshot Anki build differs from pinned build")
+    if not supports_compact_anki_build(version, build):
+        raise CompactNativeError("snapshot_anki_build_mismatch", "snapshot Anki build is unsupported")
 
 
 def _snapshot_timezone(
@@ -576,8 +573,8 @@ def create_apply_authorization(
     application_context = _snapshot_application_context(snapshot, snapshot_map)
     manifest = object_from_json(snapshot_map.get("manifest", {}), "snapshot_manifest_invalid")
     version, build = _version_values()
-    if version != PINNED_ANKI_VERSION_CANONICAL or build != PINNED_ANKI_BUILD:
-        raise CompactNativeError("unsupported_anki_build", "native write requires Anki 26.09.3 / 29bb700b")
+    if not supports_compact_anki_build(version, build):
+        raise CompactNativeError("unsupported_anki_build", "native write requires a supported Anki build")
     if application_context is None:
         raise CompactNativeError("snapshot_application_context_missing", "评分必须使用冻结的原始 context")
     if mode not in ("device_policy", "legacy_restore", "adopted_restore"):
@@ -1182,7 +1179,7 @@ class AnkiCompactAdapter:
     def capability_report(self, collection: Any) -> CompactCapabilityReport:
         version, build = _version_values()
         reasons: list[str] = []
-        exact = version == PINNED_ANKI_VERSION_CANONICAL and build == PINNED_ANKI_BUILD
+        exact = supports_compact_anki_build(version, build)
         if not exact:
             reasons.append("unsupported_anki_version_or_build")
         methods = (

@@ -212,11 +212,96 @@ class SnapshotJobsTests(unittest.TestCase):
         worker.start()
         try:
             self.assertTrue(entered.wait(1))
-            self.assertIsNone(job.poll_state(), '提交锁繁忙时立即返回待准备')
+            self.assertEqual(job.poll_state(), SnapshotJobState.PUBLISHING)
         finally:
             release.set()
             worker.join(2)
         self.assertEqual(job.poll_state(), SnapshotJobState.PUBLISHED)
+
+    def test_background_publish_releases_collection_worker(self):
+        entered, release, collection_released = (threading.Event() for _ in range(3))
+
+        def publish(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return {"published": True}
+
+        manager = SnapshotJobManager(
+            operation_adapter=QueryOpAdapter(self.host, self.source),
+            exporter=self.exporter,
+            context_provider=self.source,
+            publish=publish,
+            background_publish=True,
+        )
+        job = manager.request_snapshot(card_ids=["1"])
+
+        def run_query():
+            self.run_pending()
+            collection_released.set()
+
+        worker = threading.Thread(target=run_query)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertTrue(collection_released.wait(1))
+            self.assertEqual(job.poll_state(), SnapshotJobState.PUBLISHING)
+            self.assertFalse(manager.cancel(job.job_id))
+        finally:
+            release.set()
+            worker.join(2)
+            manager._publish_pool.shutdown(wait=True)
+            manager.stop()
+        self.assertTrue(job.result["published"])
+
+    def test_snapshot_export_uses_the_copy_and_leaves_live_queue_free(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        copied = FakeCollection(self.collection.cards.values())
+        entered, release, returned, closed = (threading.Event() for _ in range(4))
+        original_export = self.exporter.export_snapshot_from_collection
+        captured_from = []
+
+        def capture(live):
+            captured_from.append(live)
+            return SimpleNamespace(open=lambda: nullcontext(copied), close=closed.set)
+
+        def slow_export(collection, **kwargs):
+            self.assertIs(collection, copied)
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return original_export(collection, **kwargs)
+
+        manager = SnapshotJobManager(
+            operation_adapter=QueryOpAdapter(self.host, self.source),
+            exporter=self.exporter,
+            context_provider=self.source,
+            publish=self.publish,
+            capture_collection=capture,
+        )
+        job = manager.request_snapshot(card_ids=["1"])
+
+        def run_live():
+            self.run_pending()
+            returned.set()
+
+        worker = threading.Thread(target=run_live)
+        try:
+            with patch.object(self.exporter, "export_snapshot_from_collection", side_effect=slow_export):
+                worker.start()
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(returned.wait(1))
+                self.assertEqual(captured_from, [self.collection])
+                self.assertEqual(job.poll_state(), SnapshotJobState.STARTED)
+                release.set()
+                manager._publish_pool.shutdown(wait=True)
+            self.assertTrue(closed.is_set())
+            self.assertEqual(job.state, SnapshotJobState.PUBLISHED)
+        finally:
+            release.set()
+            worker.join(2)
+            manager.stop()
 
     def test_failed_publication_does_not_retain_snapshot_through_exception_chain(self):
         payloads = []

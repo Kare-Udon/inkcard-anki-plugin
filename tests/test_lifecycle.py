@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from inkcards_anki_bridge.lifecycle import LifecycleController
 from inkcards_anki_bridge.plugin import register_in_anki
@@ -43,6 +43,32 @@ class FakeRuntime:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_host_timings_end_at_render_and_sync_hooks(self) -> None:
+        for name in (
+            "state_will_change", "deck_browser_did_render", "sync_will_start",
+            "sync_did_finish", "media_sync_did_start_or_stop",
+        ):
+            setattr(self.hooks, name, FakeHook())
+        logger = Mock()
+        self.controller._logging_core = logger
+        self.controller.register()
+        self.hooks.profile_did_open.emit()
+        runtime = self.created[0]
+        runtime.recheck_collection_source = Mock()
+        with patch("inkcards_anki_bridge.lifecycle.time.monotonic", side_effect=[10, 31, 40, 63, 64, 66]):
+            self.hooks.state_will_change.emit("deckBrowser", "review")
+            self.hooks.deck_browser_did_render.emit(object())
+            self.hooks.deck_browser_did_render.emit(object())
+            self.hooks.sync_will_start.emit()
+            self.hooks.sync_did_finish.emit()
+            self.hooks.media_sync_did_start_or_stop.emit(True)
+            self.hooks.media_sync_did_start_or_stop.emit(False)
+        self.assertEqual(
+            [call.args for call in logger.timing.call_args_list],
+            [("deck_browser", 21000), ("ankiweb_collection_sync", 23000), ("ankiweb_media_sync", 2000)],
+        )
+        runtime.recheck_collection_source.assert_called_once_with()
+
     def test_external_changes_advance_current_runtime_and_own_late_callbacks_do_not(self) -> None:
         from inkcards_anki_bridge.anki.operations import CompactOperationInitiator
         self.hooks.operation_did_execute = FakeHook()

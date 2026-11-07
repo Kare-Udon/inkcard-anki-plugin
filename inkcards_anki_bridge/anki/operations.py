@@ -8,6 +8,7 @@ runtime epoch。超时/取消不会把已经开始的 closure 伪装成“未执
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Protocol
@@ -478,12 +479,14 @@ class AnkiQueryOpHost:
         parent: Any,
         *,
         schedule_on_main: Optional[Callable[[Callable[[], None]], Any]] = None,
+        timing: Callable[[int, int], Any] | None = None,
     ) -> None:
         if not callable(query_op_factory):
             raise TypeError("query_op_factory must be callable")
         self._query_op_factory = query_op_factory
         self._parent = parent
         self._schedule_on_main = schedule_on_main
+        self._timing = timing
 
     def submit_query(
         self,
@@ -498,9 +501,22 @@ class AnkiQueryOpHost:
 
         def start() -> None:
             try:
+                queued_at = time.monotonic()
+                timing = self._timing
+
+                def timed_operation(*args: Any) -> Any:
+                    started = time.monotonic()
+                    try:
+                        return operation(*args)
+                    finally:
+                        timing(
+                            int((started - queued_at) * 1000),
+                            int((time.monotonic() - started) * 1000),
+                        )
+
                 query_op = self._query_op_factory(
                     parent=self._parent,
-                    op=operation,
+                    op=timed_operation if timing is not None else operation,
                     success=lambda _value: None,
                 )
                 failure = getattr(query_op, "failure", None)

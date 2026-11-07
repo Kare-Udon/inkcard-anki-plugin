@@ -1147,9 +1147,11 @@ class SnapshotFilesService:
         transfer_id: str,
         commit_key: Any,
         present_file_ids: Any = None,
+        present_page_ids: Any = None,
     ) -> Dict[str, Any]:
         key = self._commit_key(commit_key)
         present = self._ids([] if present_file_ids is None else present_file_ids, name="present_file_ids")
+        present_pages = set(self._ids([] if present_page_ids is None else present_page_ids, name="present_page_ids"))
         normalized_present = json.dumps(present, separators=(",", ":"))
         now = self._now()
 
@@ -1210,10 +1212,15 @@ class SnapshotFilesService:
             if available != manifest_ids:
                 raise ArtifactError("artifact_files_incomplete", status=409)
             page_rows = db.execute(
-                "SELECT served FROM artifact_transfer_pages WHERE profile_id=? AND transfer_id=?",
-                (self.store.profile_id, transfer_id),
+                "SELECT tp.served, dp.file_id FROM artifact_transfer_pages tp "
+                "LEFT JOIN artifact_descriptor_pages dp ON dp.profile_id=tp.profile_id "
+                "AND dp.snapshot_id=? AND dp.page_index=tp.page_index "
+                "WHERE tp.profile_id=? AND tp.transfer_id=?",
+                (transfer["snapshot_id"], self.store.profile_id, transfer_id),
             ).fetchall()
-            if any(int(row["served"]) != 1 for row in page_rows):
+            if not present_pages.issubset({str(row["file_id"]) for row in page_rows}):
+                raise ArtifactError("present_page_ids_invalid")
+            if any(row["file_id"] is None or (int(row["served"]) != 1 and row["file_id"] not in present_pages) for row in page_rows):
                 raise ArtifactError("artifact_manifest_pages_incomplete", status=409)
             receipt = {
                 "status": "committed",

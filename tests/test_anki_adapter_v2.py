@@ -157,6 +157,12 @@ class AdapterV2Tests(unittest.TestCase):
         self.assertTrue(current.supported)
         self.assertIn("typed_due", current.capabilities)
 
+        patch = check_anki_compatibility("26.09.4", "c06370ff")
+        self.assertTrue(patch.supported)
+        self.assertIn("typed_due", patch.capabilities)
+        self.assertFalse(check_anki_compatibility("26.09.4", "29bb700b").supported)
+        self.assertFalse(check_anki_compatibility("26.09.4", None).supported)
+
         self.assertFalse(check_anki_compatibility("26.08.2", SUPPORTED_ANKI_BUILD).supported)
         self.assertFalse(check_anki_compatibility("26.08.1", "unknown-build").supported)
         self.assertFalse(check_anki_compatibility("26.9.3", SUPPORTED_ANKI_BUILD).supported)

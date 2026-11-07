@@ -1,4 +1,4 @@
-"""真实 Anki 26.09.3 + ProfileStore 的有界生产链路与独立进程中断验证。
+"""真实 Anki + ProfileStore 的有界生产链路与独立进程中断验证。
 
 所有 Collection 均由本测试在 /private/tmp 新建。正常设备策略快照经有界 QueryOp
 context producer 导出并原样发布；旧无 context 兼容入口只用于失败关闭检查。
@@ -29,6 +29,7 @@ from anki.collection import Collection
 from anki.collection_pb2 import OpChanges
 from inkcards_anki_bridge.anki.adapter_260801 import Anki260801Adapter
 from inkcards_anki_bridge.anki.application_context import SnapshotApplicationContext
+from inkcards_anki_bridge.anki.compatibility import canonical_anki_version
 from inkcards_anki_bridge.anki.compact_260903 import AnkiCompactAdapter, _capture_state
 from inkcards_anki_bridge.anki.compact_projection import canonical_json, json_sha256
 from inkcards_anki_bridge.anki.operations import OperationContext
@@ -359,7 +360,8 @@ class CompactServiceTests(unittest.TestCase):
         context = stored.application_context
         self.assertIsNotNone(context)
         self.assertEqual(context.source.scheduler_today, today - 1)
-        self.assertEqual(context.source.anki_version, "26.9.3")
+        self.assertEqual(context.source.anki_version, canonical_anki_version(buildinfo.version))
+        self.assertEqual(context.source.anki_build, buildinfo.buildhash)
         self.assertNotIn("application_context", json.loads(stored.payload_json))
         self.assertEqual(hashlib.sha256(stored.payload_json.encode()).hexdigest(), context.snapshot_checksum)
         prior_ms = (cutoff - 2 * 86400 - 3600) * 1000

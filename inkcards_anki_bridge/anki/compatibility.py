@@ -11,10 +11,19 @@ from typing import Optional, Tuple
 SUPPORTED_ANKI_VERSION = "26.08.1"
 SUPPORTED_ANKI_VERSION_CANONICAL = "26.8.1"
 SUPPORTED_ANKI_BUILD = "39e4b0b4"
+COMPACT_ANKI_TARGETS = {
+    "26.9.3": "29bb700b",
+    "26.9.4": "c06370ff",
+}
 SUPPORTED_ANKI_TARGETS = {
     SUPPORTED_ANKI_VERSION_CANONICAL: SUPPORTED_ANKI_BUILD,
-    "26.9.3": "29bb700b",
+    **COMPACT_ANKI_TARGETS,
 }
+
+
+def supports_compact_anki_build(version: Optional[str], build: Optional[str]) -> bool:
+    return build is not None and build == COMPACT_ANKI_TARGETS.get(version or "")
+
 
 READONLY_CAPABILITIES: Tuple[str, ...] = (
     "readonly_query",

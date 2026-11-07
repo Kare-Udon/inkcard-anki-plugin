@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -39,6 +40,10 @@ class SnapshotJobError(Exception):
         self.message = message
         self.status = status
         super().__init__(message)
+
+
+class SnapshotCaptureDeferred(Exception):
+    """卡库正供 Anki 使用，保留设备请求并等下一次调度。"""
 
 
 class SnapshotJobState(str, Enum):
@@ -266,6 +271,8 @@ class SnapshotJobManager:
         export_batch_size: int = DEFAULT_EXPORT_BATCH_SIZE,
         max_active_jobs: int = 16,
         max_retained_jobs: int = 64,
+        background_publish: bool = False,
+        capture_collection: Callable[[Any], Any] | None = None,
     ) -> None:
         if not isinstance(operation_adapter, QueryOpAdapter):
             raise TypeError("operation_adapter must be a QueryOpAdapter")
@@ -289,6 +296,11 @@ class SnapshotJobManager:
         self._exporter = exporter
         self._context_provider = context_provider
         self._publish = publish
+        self._capture_collection = capture_collection
+        self._publish_pool = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="inkcards-publish")
+            if background_publish or capture_collection is not None else None
+        )
         self._max_card_ids = max_card_ids
         self._max_deck_ids = max_deck_ids
         self._export_batch_size = export_batch_size
@@ -394,11 +406,7 @@ class SnapshotJobManager:
             self._jobs[job.job_id] = job
             self._trim_history()
 
-        def operation(collection: Any) -> Any:
-            with self._lock:
-                if job._state == SnapshotJobState.QUEUED:
-                    job._state = SnapshotJobState.STARTED
-            self._ensure_active(job)
+        def export(collection: Any) -> Any:
             snapshot = self._exporter.export_snapshot_from_collection(
                 collection,
                 card_ids=scope.ids if scope.kind == "card" else None,
@@ -436,11 +444,36 @@ class SnapshotJobManager:
                     "; 受影响卡片数量=" + str(len(affected)), status=409)
             return snapshot
 
+        captured = None
+
+        def operation(collection: Any) -> Any:
+            nonlocal captured
+            with self._lock:
+                if job._state == SnapshotJobState.QUEUED:
+                    job._state = SnapshotJobState.STARTED
+            self._ensure_active(job)
+            if self._capture_collection is None:
+                return export(collection)
+            captured = self._capture_collection(collection)
+            return None
+
+        def complete(result: OperationResult) -> None:
+            nonlocal captured
+            if captured is not None:
+                copy, captured = captured, None
+                with self._lock:
+                    if not self._closed and not job._cancel_requested and result.state is OperationState.COMPLETED:
+                        assert self._publish_pool is not None
+                        self._publish_pool.submit(self._export_copy, job, copy, export)
+                        return
+                copy.close()
+            self._on_operation_result(job, result)
+
         try:
             task = self._operation_adapter.submit(
                 context,
                 operation,
-                on_complete=lambda result: self._on_operation_result(job, result),
+                on_complete=complete,
             )
         except BaseException:
             with self._lock:
@@ -451,16 +484,31 @@ class SnapshotJobManager:
                 job._operation_task = task
         return job
 
-    def _on_operation_result(self, job: SnapshotJob, result: OperationResult) -> None:
-        # QueryOp success/failure callbacks are the only place where a completed
-        # typed snapshot is considered for publication. The lock is held across
-        # the atomic service publish boundary, so a concurrent cancel cannot turn
-        # an in-flight publication into a half-canceled snapshot.
+    def _export_copy(self, job: SnapshotJob, copy: Any, export: Callable[[Any], Any]) -> None:
+        try:
+            self._ensure_active(job)
+            with copy.open() as collection:
+                result = OperationResult(OperationState.COMPLETED, value=export(collection))
+        except (_SnapshotContextStale, SnapshotCaptureDeferred):
+            result = OperationResult(OperationState.STALE_RESULT_DROPPED)
+        except _SnapshotCanceled:
+            result = OperationResult(OperationState.CANCELED)
+        except Exception as error:
+            result = OperationResult(OperationState.FAILED, error=error)
+        finally:
+            copy.close()
+        self._on_operation_result(job, result, on_worker=True)
+
+    def _on_operation_result(self, job: SnapshotJob, result: OperationResult, *, on_worker: bool = False) -> None:
+        # QueryOp 只交出已导出的数据。发布不访问 collection，也不占用它的队列。
         with self._lock:
             if job._state in _FINAL_STATES:
                 return
             if job._cancel_requested or self._closed:
                 self._finish(job, SnapshotJobState.CANCELED)
+                return
+            if isinstance(result.error, SnapshotCaptureDeferred):
+                self._finish(job, SnapshotJobState.STALE_RESULT_DROPPED)
                 return
             if result.state is OperationState.STALE_RESULT_DROPPED or result.discarded:
                 self._finish(
@@ -480,21 +528,36 @@ class SnapshotJobManager:
                 self._finish(job, SnapshotJobState.STALE_RESULT_DROPPED)
                 return
             job._state = SnapshotJobState.PUBLISHING
-            try:
-                publication = self._publish(
-                    result.value,
-                    scope_id=job.scope.scope_id,
-                    generation=job.context.generation,
-                    expected_context=job.context,
-                    source_scope={"kind": job.scope.kind, "ids": list(job.scope.ids)},
-                    **({"applied_watermark": job._applied_watermark}
-                       if job._applied_watermark is not None else {}),
-                )
-            except BaseException as exc:
-                # SnapshotService.publish() is transactional. The manager does
-                # not replace its last publication on failure.
-                self._finish(job, SnapshotJobState.FAILED, error=exc)
+            if self._publish_pool is not None and not on_worker:
+                self._publish_pool.submit(self._publish_result, job, result.value)
                 return
+        self._publish_result(job, result.value)
+
+    def _publish_result(self, job: SnapshotJob, snapshot: Any) -> None:
+        with self._lock:
+            if self._closed or job._cancel_requested:
+                self._finish(job, SnapshotJobState.CANCELED)
+                return
+        try:
+            publication = self._publish(
+                snapshot,
+                scope_id=job.scope.scope_id,
+                generation=job.context.generation,
+                expected_context=job.context,
+                source_scope={"kind": job.scope.kind, "ids": list(job.scope.ids)},
+                **({"applied_watermark": job._applied_watermark}
+                   if job._applied_watermark is not None else {}),
+            )
+        except BaseException as exc:
+            with self._lock:
+                if self._closed:
+                    self._finish(job, SnapshotJobState.CANCELED)
+                elif self._safe_context() != job.context:
+                    self._finish(job, SnapshotJobState.STALE_RESULT_DROPPED)
+                else:
+                    self._finish(job, SnapshotJobState.FAILED, error=exc)
+            return
+        with self._lock:
             self._finish(job, SnapshotJobState.PUBLISHED, value=publication)
 
     def cancel(self, job_id: str) -> bool:
@@ -523,6 +586,8 @@ class SnapshotJobManager:
             self._closed = True
             jobs = list(self._active_by_scope.values())
             for job in jobs:
+                if job._state is SnapshotJobState.PUBLISHING:
+                    continue
                 job._cancel_requested = True
                 operation_task = job._operation_task
                 if operation_task is None:
@@ -531,6 +596,8 @@ class SnapshotJobManager:
                     operation_task.cancel()
                     if job._state is SnapshotJobState.QUEUED:
                         self._finish(job, SnapshotJobState.CANCELED)
+        if self._publish_pool is not None:
+            self._publish_pool.shutdown(wait=False)
 
     def get(self, job_id: str) -> Optional[SnapshotJob]:
         with self._lock:

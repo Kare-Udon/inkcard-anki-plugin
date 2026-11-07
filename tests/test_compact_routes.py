@@ -115,6 +115,26 @@ class CompactRouteTests(unittest.TestCase):
         self.assertEqual(state["compact_job"]["job_id"], "compact-1")
         self.assertNotIn("profile_identity", state["compact_job"])
 
+    def test_ack_can_end_sync_after_persisting_ratings_with_no_library_change(self) -> None:
+        def can_skip(device, session, snapshot):
+            self.assertEqual(snapshot, self.snapshot_id)
+            self.assertEqual(len(self.store.query_compact_receipts(device, session)), 1)
+            return True
+
+        self.router.skip_pull_reader = can_skip
+        payload = self.batch(1, [[1, 3, 1000, 20]])
+        status, old = self.call("/v3/reviews/compact", payload)
+        self.assertEqual(status, 200)
+        self.assertNotIn("pull_required", old)
+        status, ack = self.call("/v3/reviews/compact", {**payload, "check_pull": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(ack["pull_required"])
+        self.assertEqual(ack["receipts"], old["receipts"])
+        self.assertEqual(ack["ack_semantics"], "durably_received_not_applied")
+        self.router.skip_pull_reader = lambda *_: False
+        _, changed = self.call("/v3/reviews/compact", {**payload, "check_pull": True})
+        self.assertTrue(changed["pull_required"])
+
     def test_status_requeues_persisted_pending_work_only_when_no_job_is_cached(self) -> None:
         self.call("/v3/reviews/compact", self.batch(1, [[1, 3, 1000, 20]]))
         scheduled: list[tuple[str, str]] = []

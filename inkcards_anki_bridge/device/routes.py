@@ -102,6 +102,7 @@ class DeviceRouter:
         compact_job_requester: Optional[Callable[[str, str], Any]] = None,
         compact_job_status_reader: Optional[Callable[[str, str], Optional[Mapping[str, Any]]]] = None,
         compact_capability_reader: Optional[Callable[[], Mapping[str, Any]]] = None,
+        skip_pull_reader: Optional[Callable[[str, str, str], bool]] = None,
         limits: Optional[RouteLimits] = None,
         logger: Optional[AddonLogger] = None,
     ) -> None:
@@ -138,6 +139,7 @@ class DeviceRouter:
         if compact_job_status_reader is not None and not callable(compact_job_status_reader):
             raise TypeError("compact_job_status_reader must be callable")
         self.compact_capability_reader = compact_capability_reader
+        self.skip_pull_reader = skip_pull_reader
         self.compact_job_requester = compact_job_requester
         self.compact_job_status_reader = compact_job_status_reader
         self.store: ProfileStore = auth.store
@@ -428,6 +430,8 @@ class DeviceRouter:
                     "pull": self.snapshot_service is not None,
                     "pull_refresh": self.refresh_handler is not None,
                     "snapshot_files_v1": self.snapshot_files_service is not None,
+                    "delta_descriptor_pages": self.snapshot_files_service is not None,
+                    "ratings_only_sync": self.skip_pull_reader is not None,
                     "override": False,
                     "compact_application": self._compact_capabilities(),
                 },
@@ -708,7 +712,7 @@ class DeviceRouter:
         body = self._artifact_body(
             raw,
             required={"device_id", "session_id", "transfer_id", "commit_key"},
-            allowed={"device_id", "session_id", "transfer_id", "commit_key", "present_file_ids"},
+            allowed={"device_id", "session_id", "transfer_id", "commit_key", "present_file_ids", "present_page_ids"},
         )
         principal, session_id = self._authenticated(headers, body)
         service = self.snapshot_files_service
@@ -719,6 +723,7 @@ class DeviceRouter:
                 device_id=principal.device_id, session_id=session_id,
                 transfer_id=self._text(body["transfer_id"], code="invalid_transfer_id", maximum=128),
                 commit_key=body["commit_key"], present_file_ids=body.get("present_file_ids"),
+                present_page_ids=body.get("present_page_ids"),
             )
         if self.sync_observer is not None and result.get("status") == "committed":
             self.sync_observer("committed", device_id=body["device_id"], session_id=body["session_id"],
@@ -835,7 +840,7 @@ class DeviceRouter:
         body = self._body(
             raw,
             required={"protocol", "device_id", "session_id", "snapshot_id", "base_sequence", "events"},
-            allowed={"protocol", "device_id", "session_id", "snapshot_id", "base_sequence", "events"},
+            allowed={"protocol", "device_id", "session_id", "snapshot_id", "base_sequence", "events", "check_pull"},
         )
         if body["protocol"] != "x4-3":
             raise RouteError("unsupported_protocol")
@@ -844,6 +849,8 @@ class DeviceRouter:
         if not isinstance(events, list) or not events or len(events) > self.limits.max_review_events:
             raise RouteError("review_batch_too_large", status=413)
         snapshot_id = self._text(body["snapshot_id"], code="snapshot_id_required", maximum=256)
+        if "check_pull" in body and not isinstance(body["check_pull"], bool):
+            raise RouteError("invalid_check_pull")
         with self._review_lock:
             receipts, conflict = self.store.receive_compact_batch(
                 principal.device_id, session_id, snapshot_id, body["base_sequence"], events
@@ -856,6 +863,8 @@ class DeviceRouter:
             "receipts": [receipt.to_payload() for receipt in receipts],
             "ack_semantics": "durably_received_not_applied",
         }
+        if body.get("check_pull") and self.skip_pull_reader is not None:
+            payload["pull_required"] = not self.skip_pull_reader(principal.device_id, session_id, snapshot_id)
         if self.compact_job_requester is not None:
             # Store 已提交后才排队；worker 不会把 Collection 交给 HTTP 路由。
             payload["apply_job"] = self._request_compact_job(principal.device_id, session_id)
@@ -985,9 +994,12 @@ class DeviceRouter:
         body = self._body(
             raw,
             required={"device_id", "session_id"},
-            allowed={"device_id", "session_id"},
+            allowed={"device_id", "session_id", "base_snapshot_id"},
         )
         principal, session_id = self._authenticated(headers, body)
+        base_snapshot_id = body.get("base_snapshot_id")
+        if "base_snapshot_id" in body:
+            base_snapshot_id = self._text(base_snapshot_id, code="invalid_snapshot_id", maximum=256)
         receipts = self.inbox.query_receipts(principal.device_id, session_id)
         applications = self.inbox.query_applications(principal.device_id, session_id)
         compact_receipts = self.inbox.query_compact_receipts(principal.device_id, session_id)
@@ -1097,6 +1109,8 @@ class DeviceRouter:
                 response_payload["phase"] = "reconcile_application" if job_state == "unknown" else "blocked"
                 response_payload["last_error"] = compact_job.get("reason") or "compact_application_blocked"
         response_payload["compact_application_capability"] = self._compact_capabilities()
+        if base_snapshot_id is not None and self.skip_pull_reader is not None:
+            response_payload["pull_required"] = not self.skip_pull_reader(principal.device_id, session_id, base_snapshot_id)
         if self.compact_job_status_reader is not None or self.compact_job_requester is not None:
             response_payload["compact_job"] = compact_job
         return self._response(

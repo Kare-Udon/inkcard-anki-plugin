@@ -104,6 +104,26 @@ class ContextSource:
 
 
 class CompactJobTests(unittest.TestCase):
+    def test_host_busy_defers_queued_reviews_without_terminal_error(self):
+        self.manager._defer_when_busy = True
+        self.reviewer_owned = True
+        job = self.manager.request("device-a", "session-a")
+        self.assertEqual(job.state, CompactJobState.QUEUED)
+        self.assertEqual(self.host.pending, [])
+        self.reviewer_owned = False
+        self.manager.resume_queued()
+        self.assertEqual(job.state, CompactJobState.STARTED)
+        self.assertEqual(len(self.host.pending), 1)
+        self.reviewer_owned = True
+        self.host.start_next()
+        self.assertEqual(job.state, CompactJobState.QUEUED)
+        self.assertEqual(self.applied_calls, [])
+        self.host.pending.pop(0)  # 宿主已经拒绝的回调不再执行。
+        self.reviewer_owned = False
+        self.manager.resume_queued()
+        self.assertEqual(job.state, CompactJobState.STARTED)
+        self.assertEqual(len(self.host.pending), 1)
+
     def test_optional_job_generation_preserves_unknown_and_known_values(self):
         from inkcards_anki_bridge.device.routes import DeviceRouter
         self.assertEqual(DeviceRouter._compact_job_view({

@@ -1,10 +1,10 @@
 {
   "package": "inkcards_anki_bridge",
   "name": "InkCards Anki",
-  "human_version": "0.2.0-preview.20",
+  "human_version": "0.2.0-preview.26",
   "author": "InkCards",
   "homepage": "https://github.com/Kare-Udon/inkcard-anki-plugin",
   "conflicts": [],
   "min_point_version": 260801,
-  "max_point_version": 260903
+  "max_point_version": 260904
 }
