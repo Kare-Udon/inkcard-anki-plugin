@@ -20,7 +20,7 @@ from typing import Iterable, Mapping, Sequence, Tuple
 
 
 PACKAGE_ID = "inkcards_anki_bridge"
-HUMAN_VERSION = "0.2.0-preview.26"
+HUMAN_VERSION = "0.2.0-preview.27"
 VERSION = HUMAN_VERSION
 ARCHIVE_FILENAME = f"InkCards-Anki-Bridge-{HUMAN_VERSION}.ankiaddon"
 MIN_POINT_VERSION = 260801

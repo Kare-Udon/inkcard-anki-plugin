@@ -4,7 +4,7 @@
 
 Sync text and image cards and review records between Anki Desktop and [Xteink X4](https://www.xteink.cn/) devices.
 
-Current version: `0.2.0-preview.26`, paired with **InkCards device `0.2.86` (API 2.18)**. The add-on and device use separate version numbers.
+Current version: `0.2.0-preview.27`, paired with **InkCards device `0.2.91` (API 2.18)**. The add-on and device use separate version numbers.
 
 The bundled image converter targets macOS Apple Silicon / CPython 3.13. Image support on Windows, Linux, Intel Mac, or another Python ABI is unverified.
 
@@ -75,7 +75,7 @@ Build the package from the source root:
 python3 tools/package_ankiaddon.py
 ```
 
-Output: `dist/InkCards-Anki-Bridge-0.2.0-preview.26.ankiaddon`. Install it in Anki, restart, and open the target profile. Launch the interface through **Tools → InkCards…**. After editing the source, rebuild, reinstall, and restart Anki.
+Output: `dist/InkCards-Anki-Bridge-0.2.0-preview.27.ankiaddon`. Install it in Anki, restart, and open the target profile. Launch the interface through **Tools → InkCards…**. After editing the source, rebuild, reinstall, and restart Anki.
 
 Run packaging, pairing authentication, storage, and add-on UI tests:
 

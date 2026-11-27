@@ -240,30 +240,62 @@ def _normalize_ids(values: Sequence[Any], name: str) -> List[str]:
 class _TextCleaner(HTMLParser):
     """只取 rendered HTML 的文字，不触碰媒体文件。"""
 
+    _blocks = {"div", "p", "li", "hr", "pre", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _hidden = {"script", "style", "noscript", "template"}
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: List[str] = []
         self.media = False
         self._ignored_depth = 0
+        self._pre_depth = 0
+        self._block_boundary = False
+        self._space = False
+
+    def _append(self, value: str) -> None:
+        # 相邻块共用一个边界；读到可见内容时才换行，避免首尾多出空段。
+        if self.parts and not self.parts[-1].endswith("\n"):
+            if self._block_boundary:
+                self.parts.append("\n")
+            elif self._space and value != "\n":
+                self.parts.append(" ")
+        self._block_boundary = self._space = False
+        self.parts.append(value)
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        normalized = tag.lower()
-        if normalized in _MEDIA_TAGS:
+        if tag in _MEDIA_TAGS:
             self.media = True
-        if normalized in {"script", "style", "noscript", "template"}:
+        if tag in self._hidden:
             self._ignored_depth += 1
-
-    def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
-        if tag.lower() in _MEDIA_TAGS:
-            self.media = True
+        elif not self._ignored_depth:
+            if tag in self._blocks:
+                self._block_boundary = True
+            if tag == "br":
+                self._append("\n")
+            elif tag == "pre":
+                self._pre_depth += 1
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() in {"script", "style", "noscript", "template"} and self._ignored_depth:
+        if tag in self._hidden and self._ignored_depth:
             self._ignored_depth -= 1
+        elif not self._ignored_depth and tag in self._blocks:
+            self._block_boundary = True
+            if tag == "pre" and self._pre_depth:
+                self._pre_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if not self._ignored_depth:
-            self.parts.append(data)
+        if self._ignored_depth:
+            return
+        if self._pre_depth:
+            self._append(data.replace("\r\n", "\n").replace("\r", "\n"))
+            return
+        words = data.split()
+        if data[:1].isspace():
+            self._space = True
+        if words:
+            self._append(" ".join(words))
+        if data[-1:].isspace():
+            self._space = True
 
 
 def _clean_text(raw: Optional[str]) -> Tuple[Optional[str], bool]:
@@ -277,7 +309,9 @@ def _clean_text(raw: Optional[str]) -> Tuple[Optional[str], bool]:
         # HTML 解析失败不把原始标记当作可学习文本；调用方会记录未知模板。
         return None, False
     media = parser.media or bool(_MEDIA_TOKEN_RE.search(raw))
-    text = " ".join("".join(parser.parts).split())
+    text = "".join(parser.parts)
+    if not text.strip():
+        text = ""
     return text, media
 
 

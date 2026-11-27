@@ -4,7 +4,7 @@
 
 在 Anki Desktop 与[阅星曈 X4](https://www.xteink.cn/) 设备之间同步图文卡片与复习记录。
 
-当前版本：`0.2.0-preview.26`，配套 **InkCards 设备端 `0.2.86`（API 2.18）**。插件与设备分别编号。
+当前版本：`0.2.0-preview.27`，配套 **InkCards 设备端 `0.2.91`（API 2.18）**。插件与设备分别编号。
 
 本包的图像转换组件为 macOS Apple Silicon / CPython 3.13 构建；Windows、Linux、Intel Mac 或其他 Python ABI 的图像功能未经验证。支持范围中的 Anki 版本仍须满足该运行环境。
 
@@ -77,7 +77,7 @@
 python3 tools/package_ankiaddon.py
 ```
 
-产物：`dist/InkCards-Anki-Bridge-0.2.0-preview.26.ankiaddon`。将其安装到 Anki，重启并打开目标用户配置，即可通过「工具 → InkCards…」启动界面。修改源码后重新构建、安装并重启。
+产物：`dist/InkCards-Anki-Bridge-0.2.0-preview.27.ankiaddon`。将其安装到 Anki，重启并打开目标用户配置，即可通过「工具 → InkCards…」启动界面。修改源码后重新构建、安装并重启。
 
 运行打包、配对认证、存储和插件界面测试：
 

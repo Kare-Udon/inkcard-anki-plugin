@@ -330,6 +330,18 @@ class AdapterV2Tests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "snapshot_context_changed")
 
+    def test_card_faces_keep_visible_line_breaks(self) -> None:
+        card = FakeCard(
+            1, 10, 0, 1, card_type=0,
+            question="<div>第<b>一</b>行<br/>第二行<br><br>第四行</div>",
+            answer=("<div><p>one \n  <i>two</i></p>\n  <p>three</p></div>"
+                    "<hr id=answer><ul><li>甲</li><li>乙</li></ul>"
+                    "<style>忽略</style><pre>丙\r\n  丁</pre>"),
+        )
+        exported, = self.make_adapter(FakeCollection([card])).export_snapshot(card_ids=["1"]).cards
+        self.assertEqual(exported.question, "第一行\n第二行\n\n第四行")
+        self.assertEqual(exported.answer, "one two\nthree\n甲\n乙\n丙\n  丁")
+
     def test_media_and_empty_text_are_skipped_without_media_download(self) -> None:
         cards = [
             FakeCard(1, 10, 2, 42, question='<img src="front.png">', answer="答案"),
